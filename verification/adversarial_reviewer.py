@@ -2,12 +2,13 @@ import asyncio
 from typing import Any, Dict, List, Optional
 
 from agents.reviewer_agent import ReviewerAgent
-from core.llm_client import GeminiClient
-from models.schemas import ClaimStatus, VerificationDecision
+from config.settings import REVIEW_BATCH_SIZE
+from core.llm_client import BaseLLMClient, LLMClient
+from models.schemas import ClaimKind, ClaimStatus, VerificationDecision
 from models.verification_models import Claim, ReviewFeedback
+from utils.logger import get_logger
 from verification.claim_validator import ClaimValidator
 from verification.evidence_ledger import EvidenceLedger
-from utils.logger import get_logger
 
 logger = get_logger("adversarial_reviewer")
 
@@ -18,11 +19,13 @@ class AdversarialReviewer:
     def __init__(
         self,
         reviewer_agent: Optional[ReviewerAgent] = None,
-        llm_client: Optional[GeminiClient] = None,
+        llm_client: Optional[BaseLLMClient] = None,
+        batch_size: int = REVIEW_BATCH_SIZE,
     ):
-        self.client = llm_client or GeminiClient.get_instance()
+        self.client = llm_client or LLMClient.get_instance()
         self.reviewer_agent = reviewer_agent or ReviewerAgent(llm_client=self.client)
         self.validator = ClaimValidator()
+        self.batch_size = max(1, batch_size)
 
     async def review_claims(
         self,
@@ -30,15 +33,95 @@ class AdversarialReviewer:
         task_context: str = "",
         target_claims: Optional[List[Claim]] = None,
     ) -> List[ReviewFeedback]:
-        """Perform adversarial auditing on pending claims in the ledger."""
-        claims_to_review = target_claims or await ledger.get_all_claims(status=ClaimStatus.PENDING)
+        """Perform adversarial auditing on pending or target claims in the ledger in configurable batches."""
+        claims_to_review = (
+            target_claims
+            if target_claims is not None
+            else await ledger.get_all_claims(status=ClaimStatus.PENDING)
+        )
 
-        logger.info(f"AdversarialReviewer auditing {len(claims_to_review)} claim(s)...")
+        logger.info(
+            f"AdversarialReviewer auditing {len(claims_to_review)} claim(s) "
+            f"in batches of up to {self.batch_size}..."
+        )
         feedback_results: List[ReviewFeedback] = []
 
-        for claim in claims_to_review:
-            feedback = await self.review_single_claim(claim, ledger, task_context)
-            feedback_results.append(feedback)
+        for i in range(0, len(claims_to_review), self.batch_size):
+            batch = claims_to_review[i : i + self.batch_size]
+
+            # Gather associated evidence for the claims in this batch
+            evidence_by_claim: Dict[str, List[Any]] = {}
+            for claim in batch:
+                evidence_by_claim[claim.claim_id] = await ledger.get_evidence_for_claim(claim.claim_id)
+
+            # Audit batch in single structured LLM call
+            batch_feedbacks = await self.reviewer_agent.evaluate_claims_batch(
+                claims=batch,
+                evidence_by_claim=evidence_by_claim,
+                task_context=task_context,
+            )
+
+            feedbacks_map = {fb.claim_id: fb for fb in batch_feedbacks}
+
+            for claim in batch:
+                feedback = feedbacks_map.get(claim.claim_id)
+                if not feedback:
+                    # Bounded safety fallback: never accept if feedback was missing
+                    feedback = ReviewFeedback(
+                        claim_id=claim.claim_id,
+                        decision=VerificationDecision.UNVERIFIABLE,
+                        reasoning="Evaluation feedback missing from batch audit response.",
+                        critique="Verification audit could not be mapped to claim ID.",
+                        is_supported_by_evidence=False,
+                    )
+
+                # Heuristic validation: flag superlatives or ungrounded absolutes
+                ev_items = evidence_by_claim.get(claim.claim_id, [])
+                is_structurally_valid, issues = self.validator.validate_claim_structure(claim, evidence_items=ev_items)
+                if not is_structurally_valid and feedback.decision == VerificationDecision.ACCEPT:
+                    feedback.decision = VerificationDecision.REQUEST_REVISION
+                    feedback.reasoning += f" [Heuristic Flag: {'; '.join(issues)}]"
+                    feedback.suggested_fix = (
+                        (feedback.suggested_fix or "")
+                        + " Remove absolute unverified superlatives or provide empirical proof."
+                    )
+
+                if feedback.decision == VerificationDecision.ACCEPT and claim.claim_kind in (
+                    ClaimKind.PROPOSED_TARGET,
+                    ClaimKind.ASSUMPTION,
+                    ClaimKind.RECOMMENDATION,
+                ):
+                    feedback.decision = VerificationDecision.REQUEST_REVISION
+                    feedback.reasoning += (
+                        f" [Heuristic Flag: {claim.claim_kind} cannot be accepted as an established factual result.]"
+                    )
+                    feedback.suggested_fix = (
+                        (feedback.suggested_fix or "")
+                        + " Keep this explicitly labeled as a target, assumption, or recommendation."
+                    )
+
+                # Map decision to ClaimStatus
+                if feedback.decision == VerificationDecision.ACCEPT:
+                    status = ClaimStatus.SUPPORTED
+                elif feedback.decision == VerificationDecision.REJECT:
+                    status = ClaimStatus.REJECTED
+                elif feedback.decision == VerificationDecision.REQUEST_REVISION:
+                    status = ClaimStatus.NEEDS_REVISION
+                else:
+                    status = ClaimStatus.UNVERIFIABLE
+
+                # Update in-memory claim object
+                claim.status = status
+                claim.reviewer_feedback = f"[{feedback.decision}] {feedback.reasoning}"
+
+                # Update ledger state
+                await ledger.update_claim_status(
+                    claim_id=claim.claim_id,
+                    status=status,
+                    reviewer_feedback=claim.reviewer_feedback,
+                )
+
+                feedback_results.append(feedback)
 
         accepted_count = sum(1 for f in feedback_results if f.decision == VerificationDecision.ACCEPT)
         rejected_count = sum(1 for f in feedback_results if f.decision == VerificationDecision.REJECT)
@@ -59,39 +142,18 @@ class AdversarialReviewer:
         ledger: EvidenceLedger,
         task_context: str = "",
     ) -> ReviewFeedback:
-        """Audit an individual claim against its registered evidence."""
-        # Step 1: Pre-check heuristic validation
-        is_structurally_valid, issues = self.validator.validate_claim_structure(claim)
-        evidence_items = await ledger.get_evidence_for_claim(claim.claim_id)
-
-        # Step 2: Adversarial scrutiny via ReviewerAgent
-        feedback = await self.reviewer_agent.evaluate_claim(
-            claim=claim,
-            evidence_items=evidence_items,
+        """Audit an individual claim against its registered evidence (backward compatibility)."""
+        results = await self.review_claims(
+            ledger=ledger,
             task_context=task_context,
+            target_claims=[claim],
         )
+        if results:
+            return results[0]
 
-        # If heuristic detected ungrounded superlatives, do not allow plain acceptance
-        if not is_structurally_valid and feedback.decision == VerificationDecision.ACCEPT:
-            feedback.decision = VerificationDecision.REQUEST_REVISION
-            feedback.reasoning += f" [Heuristic Flag: {'; '.join(issues)}]"
-            feedback.suggested_fix = (feedback.suggested_fix or "") + " Remove absolute unverified superlatives."
-
-        # Step 3: Map decision to ClaimStatus and update ledger
-        if feedback.decision == VerificationDecision.ACCEPT:
-            status = ClaimStatus.SUPPORTED
-        elif feedback.decision == VerificationDecision.REJECT:
-            status = ClaimStatus.REJECTED
-        elif feedback.decision == VerificationDecision.REQUEST_REVISION:
-            status = ClaimStatus.NEEDS_REVISION
-        else:
-            status = ClaimStatus.UNVERIFIABLE
-
-        await ledger.update_claim_status(
+        return ReviewFeedback(
             claim_id=claim.claim_id,
-            status=status,
-            reviewer_feedback=f"[{feedback.decision}] {feedback.reasoning}",
+            decision=VerificationDecision.UNVERIFIABLE,
+            reasoning="Audit produced no feedback.",
+            is_supported_by_evidence=False,
         )
-
-        return feedback
-

@@ -1,6 +1,6 @@
 from typing import Any, Dict, Optional
 
-from core.llm_client import GeminiClient
+from core.llm_client import BaseLLMClient
 from core.orchestrator import MedhaOrchestrator, MedhaResult
 from utils.logger import get_logger
 
@@ -12,7 +12,7 @@ class MedhaBenchmarkRunner:
 
     def __init__(
         self,
-        llm_client: Optional[GeminiClient] = None,
+        llm_client: Optional[BaseLLMClient] = None,
         max_concurrency: int = 4,
         max_repair_iterations: int = 2,
     ):

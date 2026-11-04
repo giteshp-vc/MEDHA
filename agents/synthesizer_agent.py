@@ -4,9 +4,10 @@ from typing import Any, Dict, List, Optional
 
 from agents.base_agent import BaseAgent
 from models.agent_models import AgentConfig, AgentResponse
-from models.schemas import AgentStatus
+from models.schemas import AgentStatus, ClaimKind
 from models.verification_models import Claim, RepairAttempt, VerificationReport
 from utils.logger import get_logger
+from verification.claim_extractor import classify_claim_kind
 
 logger = get_logger("synthesizer_agent")
 
@@ -24,7 +25,8 @@ class SynthesizerAgent(BaseAgent):
             objective="Synthesize verified specialist outputs into a rigorous, transparent solution.",
             instructions=(
                 "Synthesize accepted claims, explicitly exclude rejected claims, "
-                "disclose assumptions, and preserve unresolved questions and uncertainties."
+                "disclose assumptions, and preserve unresolved questions and uncertainties. "
+                "Maintain strict evidence provenance: never present ungrounded targets as measured facts."
             ),
         )
         super().__init__(cfg, llm_client=llm_client)
@@ -35,12 +37,19 @@ class SynthesizerAgent(BaseAgent):
         specialist_results: List[Dict[str, Any]],
         verification_report: VerificationReport,
         unresolved_questions: List[str],
+        partial_execution_notice: Optional[str] = None,
     ) -> str:
         """Produce the final transparent synthesized answer."""
         self.update_status(AgentStatus.EXECUTING)
         start_time = time.perf_counter()
 
         logger.info(f"Synthesizer synthesizing {len(specialist_results)} specialist results...")
+
+        support_rate_text = (
+            f"{verification_report.support_rate:.1f}%"
+            if verification_report.support_rate is not None
+            else "N/A (no claims reviewed)"
+        )
 
         # Format accepted claims
         accepted_text = "\n".join(
@@ -54,6 +63,23 @@ class SynthesizerAgent(BaseAgent):
             for c in verification_report.rejected_claims
         ) or "None rejected."
 
+        # Format needs revision / unverifiable claims
+        needs_rev_text = "\n".join(
+            f"- [NEEDS REVISION Claim {c.claim_id}] ({c.originating_role}): {c.claim_text}"
+            for c in verification_report.needs_revision_claims
+        ) or "None pending revision."
+
+        unverifiable_text = "\n".join(
+            f"- [UNVERIFIABLE Claim {c.claim_id}] ({c.originating_role}): {c.claim_text} | Note: {c.reviewer_feedback or 'Unverifiable'}"
+            for c in verification_report.unverifiable_claims
+        ) or "None unverifiable."
+
+        # Format unreviewed claims (interrupted before review)
+        unreviewed_text = "\n".join(
+            f"- [UNREVIEWED Claim {c.claim_id}] ({c.originating_role}): {c.claim_text} | Note: {c.reviewer_feedback or 'Not audited due to audit interruption'}"
+            for c in verification_report.unreviewed_claims
+        ) or "None unreviewed."
+
         # Format repairs
         repairs_text = "\n".join(
             f"- [Repaired Claim {r.claim_id}]: Original '{r.original_claim_text}' -> Revised: '{r.revised_claim_text}'"
@@ -65,12 +91,16 @@ class SynthesizerAgent(BaseAgent):
         for s in specialist_results:
             specialist_text += (
                 f"\n\n### Specialist: {s.get('role')} (Subtask: {s.get('subtask_id')})\n"
+                f"Status: {s.get('status', 'UNKNOWN')}\n"
+                f"Execution diagnostic: {s.get('error') or 'None'}\n"
                 f"Findings: {json.dumps(s.get('findings', []))}\n"
                 f"Assumptions: {json.dumps(s.get('assumptions', []))}\n"
                 f"Deliverable Details:\n{s.get('output', '')}\n"
             )
 
         questions_text = "\n".join(f"- {q}" for q in unresolved_questions) or "None recorded."
+
+        partial_notice_str = f"\n\n### NOTICE:\n{partial_execution_notice}\n" if partial_execution_notice else ""
 
         system_instruction = (
             "You are the Lead Synthesizer for MEDHA (Multi-Agent Evidence-Driven Architecture).\n"
@@ -80,15 +110,29 @@ class SynthesizerAgent(BaseAgent):
             "2. Evidence Traceability: Base factual conclusions strictly on ACCEPTED claims. Reference claim IDs where helpful.\n"
             "3. Explicit Exclusions: Do NOT include rejected claims as facts. Disclose what was rejected or unverified and why.\n"
             "4. Transparent Uncertainty: Do not paper over disagreements or unknowns. Emphasize unresolved questions.\n"
-            "5. Structure: Use clean Markdown headers (Executive Summary, Architecture/Solution Design, "
+            "5. Verified Fidelity: Never present fallback text or unverified assertions as verified results. "
+            f"Under Evidence & Verification Audit, you MUST report the official Claim Support Rate ({support_rate_text}) "
+            f"and exact counts (Accepted: {len(verification_report.accepted_claims)}, Rejected: {len(verification_report.rejected_claims)}, "
+            f"Unverifiable: {len(verification_report.unverifiable_claims)}, Unreviewed: {len(verification_report.unreviewed_claims)}). "
+            f"Explain verification unavailability using this audit status: {verification_report.summary_message or 'No audit status available.'}\n"
+            "6. Strict Evidence Provenance: Distinguish actual external evidence from assumptions and proposed design targets. "
+            "Model agreement or reviewer acceptance alone confirms logical soundness, not empirical reality. "
+            "Never present assumptions or proposed metrics as verified experimental measurements.\n"
+            "7. Structure: Use clean Markdown headers (Executive Summary, Architecture/Solution Design, "
             "Evidence & Verification Audit, Operating Assumptions, Unresolved Edge Cases)."
         )
 
         prompt = (
-            f"ORIGINAL USER TASK:\n{task_description}\n\n"
+            f"ORIGINAL USER TASK:\n{task_description}\n"
+            f"{partial_notice_str}\n"
             f"VERIFICATION STATUS:\n"
+            f"- Official Support Rate: {support_rate_text}\n"
+            f"- Verification Availability: {verification_report.summary_message or 'No audit status available.'}\n"
             f"- Accepted Claims ({len(verification_report.accepted_claims)}):\n{accepted_text}\n\n"
             f"- Rejected Claims ({len(verification_report.rejected_claims)}):\n{rejected_text}\n\n"
+            f"- Needs Revision Claims ({len(verification_report.needs_revision_claims)}):\n{needs_rev_text}\n\n"
+            f"- Unverifiable Claims ({len(verification_report.unverifiable_claims)}):\n{unverifiable_text}\n\n"
+            f"- Unreviewed Claims ({len(verification_report.unreviewed_claims)}):\n{unreviewed_text}\n\n"
             f"- Repaired Claims ({len(verification_report.repair_history)}):\n{repairs_text}\n\n"
             f"SPECIALIST CONTRIBUTIONS:\n{specialist_text}\n\n"
             f"UNRESOLVED QUESTIONS & RISKS:\n{questions_text}\n\n"
@@ -104,11 +148,12 @@ class SynthesizerAgent(BaseAgent):
             )
         except Exception as e:
             logger.error(f"Synthesizer failed to generate final text: {e}")
-            final_answer = (
-                f"# MEDHA Synthesis (Fallback)\n\n"
-                f"An error occurred during final text generation: {e}.\n\n"
-                f"### Verified Findings Summary:\n{accepted_text}\n\n"
-                f"### Excluded/Rejected Claims:\n{rejected_text}"
+            final_answer = self._build_deterministic_fallback(
+                specialist_results=specialist_results,
+                verification_report=verification_report,
+                unresolved_questions=unresolved_questions,
+                partial_execution_notice=partial_execution_notice,
+                synthesis_error=e,
             )
 
         duration = round(time.perf_counter() - start_time, 3)
@@ -117,6 +162,119 @@ class SynthesizerAgent(BaseAgent):
 
         logger.info(f"Synthesizer completed final answer in {duration}s ({len(final_answer)} chars).")
         return final_answer
+
+    @staticmethod
+    def _build_deterministic_fallback(
+        specialist_results: List[Dict[str, Any]],
+        verification_report: VerificationReport,
+        unresolved_questions: List[str],
+        partial_execution_notice: Optional[str],
+        synthesis_error: Exception,
+    ) -> str:
+        def claim_list(claims: List[Claim]) -> str:
+            formatted = []
+            for claim in claims:
+                provenance = claim.source_provenance or [{
+                    "agent_id": claim.originating_agent,
+                    "role": claim.originating_role,
+                    "subtask_id": claim.subtask_id,
+                }]
+                sources = "; ".join(
+                    f"{source.get('role', '')} ({source.get('agent_id', '')}, "
+                    f"{source.get('subtask_id', '')})"
+                    for source in provenance
+                )
+                evidence = ", ".join(claim.evidence_references) or "none"
+                formatted.append(
+                    f"- [{claim.claim_id}] status={claim.status}; sources=[{sources}]; "
+                    f"evidence_references=[{evidence}]: {claim.claim_text}"
+                )
+            return "\n".join(formatted) or "- None."
+
+        all_claims = (
+            verification_report.accepted_claims
+            + verification_report.rejected_claims
+            + verification_report.needs_revision_claims
+            + verification_report.unverifiable_claims
+            + verification_report.unreviewed_claims
+        )
+        targets = [claim for claim in all_claims if claim.claim_kind == ClaimKind.PROPOSED_TARGET]
+        measurements = [claim for claim in all_claims if claim.claim_kind == ClaimKind.EMPIRICAL_RESULT]
+        target_texts = [claim.claim_text for claim in targets]
+        measurement_texts = [claim.claim_text for claim in measurements]
+        recommendations: List[str] = []
+        assumptions: List[str] = []
+        specialist_sections: List[str] = []
+
+        for specialist in specialist_results:
+            findings = specialist.get("findings", [])
+            specialist_sections.append(
+                f"### {specialist.get('role', 'Unknown specialist')} "
+                f"({specialist.get('subtask_id', 'unknown')})\n"
+                f"Status: {specialist.get('status', 'UNKNOWN')}\n\n"
+                "Unverified findings:\n"
+                + ("\n".join(f"- {finding}" for finding in findings) or "- None.")
+                + "\n\nUnverified pre-identified claims:\n"
+                + ("\n".join(f"- {text}" for text in specialist.get("claims", [])) or "- None.")
+                + "\n\nUnverified deliverable:\n"
+                + (specialist.get("output") or "None.")
+            )
+            assumptions.extend(specialist.get("assumptions", []))
+            for text in list(findings) + list(specialist.get("claims", [])):
+                kind = classify_claim_kind(text, specialist.get("assumptions", []))
+                if kind == ClaimKind.PROPOSED_TARGET:
+                    target_texts.append(text)
+                elif kind == ClaimKind.EMPIRICAL_RESULT:
+                    measurement_texts.append(text)
+                elif kind == ClaimKind.RECOMMENDATION:
+                    recommendations.append(text)
+                elif kind == ClaimKind.ASSUMPTION:
+                    assumptions.append(text)
+
+        recommendations.extend(
+            claim.claim_text for claim in all_claims if claim.claim_kind == ClaimKind.RECOMMENDATION
+        )
+        assumptions.extend(
+            claim.claim_text for claim in all_claims if claim.claim_kind == ClaimKind.ASSUMPTION
+        )
+
+        support_rate = (
+            f"{verification_report.support_rate:.1f}%"
+            if verification_report.support_rate is not None
+            else "N/A (no claims reviewed)"
+        )
+        notice = partial_execution_notice or "No separate interruption notice was recorded."
+        questions = "\n".join(f"- {question}" for question in unresolved_questions) or "- None recorded."
+
+        return (
+            "# Deterministic Synthesis Report\n\n"
+            "**UNVERIFIED COMPILATION:** All specialist-generated content below is unverified unless explicitly "
+            "listed in the review status section. Reviewer acceptance does not establish empirical results or "
+            "replace missing external evidence.\n\n"
+            "### Interruption\n"
+            f"- Synthesis generation failed: {type(synthesis_error).__name__}: {synthesis_error}\n"
+            f"- Verification / execution status: {verification_report.summary_message or 'Unavailable.'}\n"
+            f"- Execution notice: {notice}\n\n"
+            "### Specialist Contributions (Unverified)\n"
+            + ("\n\n".join(specialist_sections) or "No specialist output was available.")
+            + "\n\n### Assumptions (Unverified)\n"
+            + ("\n".join(f"- {item}" for item in dict.fromkeys(assumptions)) or "- None recorded.")
+            + "\n\n### Recommendations (Unverified)\n"
+            + ("\n".join(f"- {item}" for item in dict.fromkeys(recommendations)) or "- None recorded.")
+            + "\n\n### Proposed Performance Targets (Not Measurements)\n"
+            + ("\n".join(f"- {text}" for text in dict.fromkeys(target_texts)) or "- None.")
+            + "\n\n### Specialist-Reported Empirical Results (Unverified)\n"
+            + ("\n".join(f"- {text}" for text in dict.fromkeys(measurement_texts)) or "- None.")
+            + "\n\n### Verification Audit\n"
+            + f"- Support rate: {support_rate}\n"
+            + f"- Reviewed / supported: {claim_list(verification_report.accepted_claims)}\n"
+            + f"- Rejected: {claim_list(verification_report.rejected_claims)}\n"
+            + f"- Unverifiable: {claim_list(verification_report.unverifiable_claims)}\n"
+            + f"- Unreviewed: {claim_list(verification_report.unreviewed_claims)}\n"
+            + f"- Needs revision: {claim_list(verification_report.needs_revision_claims)}\n\n"
+            "### Unresolved Questions\n"
+            + questions
+        )
 
     async def execute(self, context: Optional[Dict[str, Any]] = None) -> AgentResponse:
         """Generic execution implementation to satisfy BaseAgent contract."""
@@ -129,4 +287,3 @@ class SynthesizerAgent(BaseAgent):
             content="Synthesizer initialized.",
             status=self.status,
         )
-

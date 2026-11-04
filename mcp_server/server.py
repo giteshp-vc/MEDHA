@@ -56,7 +56,7 @@ async def get_verification_report(execution_id: str) -> str:
 
 @mcp.tool()
 async def run_baseline(task: str, model: str = "") -> str:
-    """Run a single-agent baseline answer using direct Gemini generation with no multi-agent orchestration."""
+    """Run a single-agent baseline answer using direct LLM generation with no multi-agent orchestration."""
     logger.info(f"MCP tool 'run_baseline' called for: '{task[:60]}...'")
     result = await run_baseline_impl(task=task, model=model if model else None)
     return json.dumps(result, indent=2)

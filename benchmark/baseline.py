@@ -2,7 +2,7 @@ import time
 from typing import Any, Dict, Optional
 from pydantic import Field
 
-from core.llm_client import GeminiClient
+from core.llm_client import BaseLLMClient, create_llm_client
 from models.schemas import BaseSchema
 from utils.helpers import utcnow_iso
 from utils.logger import get_logger
@@ -34,12 +34,12 @@ class SingleAgentBaseline:
 
     def __init__(
         self,
-        llm_client: Optional[GeminiClient] = None,
+        llm_client: Optional[BaseLLMClient] = None,
         model: Optional[str] = None,
         temperature: float = 0.2,
     ):
         self.tracker = TokenTracker(name="baseline_tracker")
-        self.client = llm_client or GeminiClient(token_tracker=self.tracker)
+        self.client = llm_client or create_llm_client(token_tracker=self.tracker)
         self.model = model or self.client.default_model
         self.temperature = temperature
 

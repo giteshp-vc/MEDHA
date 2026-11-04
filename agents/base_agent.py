@@ -2,7 +2,7 @@ from abc import ABC, abstractmethod
 import time
 from typing import Any, Dict, List, Optional
 
-from core.llm_client import GeminiClient
+from core.llm_client import BaseLLMClient, LLMClient
 from models.agent_models import AgentConfig, AgentResponse
 from models.schemas import AgentStatus
 from utils.helpers import generate_id
@@ -17,7 +17,7 @@ class BaseAgent(ABC):
     def __init__(
         self,
         config: AgentConfig,
-        llm_client: Optional[GeminiClient] = None,
+        llm_client: Optional[BaseLLMClient] = None,
     ):
         self.agent_id: str = config.agent_id or generate_id("agent")
         self.role: str = config.role
@@ -36,7 +36,7 @@ class BaseAgent(ABC):
         self.evidence_references: List[str] = []
         self.unresolved_questions: List[str] = []
 
-        self.client = llm_client or GeminiClient.get_instance()
+        self.client = llm_client or LLMClient.get_instance()
         self.last_execution_duration: float = 0.0
 
     def update_status(self, new_status: AgentStatus) -> None:

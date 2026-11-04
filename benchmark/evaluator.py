@@ -16,6 +16,18 @@ from utils.logger import get_logger
 logger = get_logger("benchmark_evaluator")
 
 
+def _format_pct(val: Any) -> str:
+    """Safely format rate as percentage, handling both fraction (0.0-1.0) and percentage (0.0-100.0)."""
+    if val is None:
+        return "N/A"
+    try:
+        f = float(val or 0.0)
+        pct = f * 100.0 if (0.0 < f <= 1.0) else f
+        return f"{pct:.1f}%"
+    except (ValueError, TypeError):
+        return "N/A"
+
+
 class BenchmarkEvaluator:
     """Evaluates and compares Mode A (Single-Agent Baseline) vs Mode B (MEDHA Multi-Agent)."""
 
@@ -59,9 +71,7 @@ class BenchmarkEvaluator:
 
         # Evaluate coverage of reference criteria using concept extraction
         for criterion in reference_criteria:
-            # Extract key nouns and technical terms from criterion
             words = [w.strip(".,;:()[]\"'").lower() for w in criterion.split() if len(w) > 4]
-            # If at least half the key words or the full phrase are present, count as matched
             if words and sum(1 for w in words if w in answer_lower) >= max(1, len(words) // 2):
                 matched.append(criterion)
             else:
@@ -141,8 +151,8 @@ class BenchmarkEvaluator:
                 "total_claims": v_rep.get("total_claims", len(m_res.claims)),
                 "accepted_claims_count": len(v_rep.get("accepted_claims", [])),
                 "rejected_claims_count": len(v_rep.get("rejected_claims", [])),
-                "support_rate": v_rep.get("support_rate", 0.0),
-                "unsupported_rate": v_rep.get("unsupported_rate", 0.0),
+                "support_rate": v_rep.get("support_rate"),
+                "unsupported_rate": v_rep.get("unsupported_rate"),
                 "repair_success_rate": v_rep.get("repair_success_rate", 0.0),
             }
             eval_m = self.evaluate_answer(
@@ -245,13 +255,12 @@ class BenchmarkEvaluator:
             "| :--- | :--- | :--- | :--- |\n",
             f"| **Task Completion Rate** | {bm['task_completion_rate']*100:.1f}% | {mm['task_completion_rate']*100:.1f}% | {round((mm['task_completion_rate'] - bm['task_completion_rate'])*100, 1):+0.1f}% |\n",
             f"| **Reference Criteria Coverage** | {bm['reference_criteria_coverage']*100:.1f}% | {mm['reference_criteria_coverage']*100:.1f}% | {round((mm['reference_criteria_coverage'] - bm['reference_criteria_coverage'])*100, 1):+0.1f}% |\n",
-            f"| **Claim Support Rate** | N/A (unverified) | {mm['claim_support_rate']*100:.1f}% | Audited &\nTraceable |\n",
-            f"| **Unsupported Claim Rate** | N/A (unverified) | {mm['unsupported_claim_rate']*100:.1f}% | Filtered / Repaired |\n",
-            f"| **Reviewer Rejection Rate** | 0.0% (no review) | {mm['reviewer_rejection_rate']*100:.1f}% | Active Scrutiny |\n",
-            f"| **Repair Success Rate** | N/A | {mm['repair_success_rate']*100:.1f}% | Precision Fixes |\n",
+            f"| **Claim Support Rate** | N/A (unverified) | {_format_pct(mm['claim_support_rate'])} | Audited & Traceable |\n",
+            f"| **Unsupported Claim Rate** | N/A (unverified) | {_format_pct(mm['unsupported_claim_rate'])} | Filtered / Repaired |\n",
+            f"| **Reviewer Rejection Rate** | 0.0% (no review) | {_format_pct(mm['reviewer_rejection_rate'])} | Active Scrutiny |\n",
+            f"| **Repair Success Rate** | N/A | {_format_pct(mm['repair_success_rate'])} | Precision Fixes |\n",
             f"| **Average Latency** | {bm['avg_latency_seconds']:.2f}s | {mm['avg_latency_seconds']:.2f}s | {round(mm['avg_latency_seconds'] - bm['avg_latency_seconds'], 2):+0.2f}s |\n",
             f"| **Avg Tokens per Task** | {bm['avg_tokens_per_task']:.0f} | {mm['avg_tokens_per_task']:.0f} | {round(mm['avg_tokens_per_task'] - bm['avg_tokens_per_task'], 0):+0.0f} |\n",
             f"| **Estimated Cost (USD)** | ${bm['estimated_cost_usd']:.4f} | ${mm['estimated_cost_usd']:.4f} | +${round(mm['estimated_cost_usd'] - bm['estimated_cost_usd'], 4):.4f} |\n",
         ]
         return "".join(md)
-

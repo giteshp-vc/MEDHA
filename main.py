@@ -2,11 +2,11 @@ import argparse
 import asyncio
 import sys
 import time
-from typing import Optional
+from typing import Any, Optional
 
 from benchmark.baseline import SingleAgentBaseline
 from benchmark.evaluator import BenchmarkEvaluator
-from config.settings import validate_settings
+from config.settings import LLM_PROVIDER, validate_settings
 from core.orchestrator import MedhaOrchestrator
 from utils.logger import get_logger
 
@@ -22,12 +22,24 @@ BANNER = """
 """
 
 
+def _format_rate(val: Any) -> str:
+    """Format rate as percentage string, safely handling both fraction (0.0-1.0) and percentage (0.0-100.0)."""
+    if val is None:
+        return "N/A (no claims reviewed)"
+    try:
+        f = float(val or 0.0)
+        pct = f * 100.0 if (0.0 < f <= 1.0) else f
+        return f"{pct:.1f}%"
+    except (ValueError, TypeError):
+        return "N/A"
+
+
 async def run_interactive_session():
     """Run interactive terminal session for MEDHA."""
     print(BANNER)
     try:
         validate_settings()
-        print("[OK] Configuration and Gemini API credentials verified.")
+        print(f"[OK] Configuration and {LLM_PROVIDER.upper()} API credentials verified.")
     except Exception as e:
         print(f"[ERROR] Configuration error: {e}")
         sys.exit(1)
@@ -80,9 +92,9 @@ async def run_interactive_session():
             print(f"Claims Supported:      {len(rep.get('accepted_claims', []))}")
             print(f"Claims Rejected:       {len(rep.get('rejected_claims', []))}")
             print(f"Claims Unverifiable:   {len(rep.get('unverifiable_claims', []))}")
-            print(f"Claim Support Rate:    {rep.get('support_rate', 0.0)*100:.1f}%")
+            print(f"Claim Support Rate:    {_format_rate(rep.get('support_rate', 0.0))}")
             print(f"Repair Cycles:         {len(result.repair_history)}")
-            print(f"Repair Success Rate:   {rep.get('repair_success_rate', 0.0)*100:.1f}%")
+            print(f"Repair Success Rate:   {_format_rate(rep.get('repair_success_rate', 0.0))}")
 
             tokens = result.token_usage
             if tokens:
@@ -114,7 +126,7 @@ async def run_single_task(task_text: str):
     print(result.final_answer)
     print("\n--- Summary ---")
     print(f"Execution ID: {result.execution_id} | Duration: {result.duration_seconds}s | Status: {result.status}")
-    print(f"Support Rate: {result.verification_report.get('support_rate', 0.0)*100:.1f}%")
+    print(f"Support Rate: {_format_rate(result.verification_report.get('support_rate', 0.0))}")
 
 
 async def run_benchmark_cli():
@@ -176,4 +188,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

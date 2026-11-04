@@ -64,7 +64,7 @@ async def run_medha_task_impl(
             "total_claims": rep.get("total_claims", 0),
             "accepted_claims_count": len(rep.get("accepted_claims", [])),
             "rejected_claims_count": len(rep.get("rejected_claims", [])),
-            "support_rate": rep.get("support_rate", 0.0),
+            "support_rate": rep.get("support_rate"),
             "repair_success_rate": rep.get("repair_success_rate", 0.0),
         },
         "token_usage": result.token_usage,
@@ -112,7 +112,7 @@ async def get_verification_report_impl(execution_id: str) -> Dict[str, Any]:
     return {
         "execution_id": execution_id,
         "total_claims": rep.get("total_claims", len(data.get("claims", []))),
-        "support_rate": rep.get("support_rate", 0.0),
+        "support_rate": rep.get("support_rate"),
         "accepted_claims": rep.get("accepted_claims", []),
         "rejected_claims": rep.get("rejected_claims", []),
         "unverifiable_claims": rep.get("unverifiable_claims", []),

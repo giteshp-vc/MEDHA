@@ -1,6 +1,7 @@
 import asyncio
 from typing import Any, Dict, List, Optional
 
+from config.settings import MAX_CLAIMS_PER_TASK
 from models.schemas import ClaimStatus, EvidenceSourceType
 from models.verification_models import Claim, Evidence, RepairAttempt, ReviewFeedback, VerificationReport
 from utils.helpers import utcnow_iso
@@ -12,32 +13,89 @@ logger = get_logger("evidence_ledger")
 class EvidenceLedger:
     """Centralized verifiable repository maintaining all claims, supporting evidence, and verification statuses."""
 
-    def __init__(self, task_id: str = ""):
+    def __init__(self, task_id: str = "", max_claims: int = MAX_CLAIMS_PER_TASK):
         self.task_id = task_id
+        self.max_claims = max_claims
         self._claims: Dict[str, Claim] = {}
+        self._claim_text_index: Dict[str, str] = {}
         self._evidence: Dict[str, Evidence] = {}
         self._claim_evidence_map: Dict[str, List[str]] = {}
         self._lock = asyncio.Lock()
 
     async def register_claim(self, claim: Claim) -> str:
-        """Register a claim in the ledger."""
+        """Register a claim in the ledger up to max_claims limit."""
         async with self._lock:
+            key = self._normalize_claim_text(claim.claim_text)
+            existing_id = self._claim_text_index.get(key)
+            if existing_id:
+                self._merge_claim(self._claims[existing_id], claim)
+                return existing_id
+            if len(self._claims) >= self.max_claims and claim.claim_id not in self._claims:
+                logger.warning(
+                    f"Ledger claim budget ({self.max_claims}) reached. Claim [{claim.claim_id}] was not registered."
+                )
+                return claim.claim_id
+
             self._claims[claim.claim_id] = claim
+            self._claim_text_index[key] = claim.claim_id
+            self._ensure_claim_provenance(claim)
             if claim.claim_id not in self._claim_evidence_map:
                 self._claim_evidence_map[claim.claim_id] = []
             logger.debug(f"Registered claim [{claim.claim_id}] from [{claim.originating_role}]")
             return claim.claim_id
 
     async def register_claims_batch(self, claims: List[Claim]) -> List[str]:
-        """Register multiple claims."""
+        """Register multiple claims up to max_claims limit."""
         async with self._lock:
             ids = []
             for claim in claims:
+                key = self._normalize_claim_text(claim.claim_text)
+                existing_id = self._claim_text_index.get(key)
+                if existing_id:
+                    self._merge_claim(self._claims[existing_id], claim)
+                    ids.append(existing_id)
+                    continue
+                if len(self._claims) >= self.max_claims and claim.claim_id not in self._claims:
+                    logger.warning(
+                        f"Ledger claim budget ({self.max_claims}) reached. Excess claim [{claim.claim_id}] was not registered."
+                    )
+                    continue
                 self._claims[claim.claim_id] = claim
+                self._claim_text_index[key] = claim.claim_id
+                self._ensure_claim_provenance(claim)
                 if claim.claim_id not in self._claim_evidence_map:
                     self._claim_evidence_map[claim.claim_id] = []
                 ids.append(claim.claim_id)
             return ids
+
+    @staticmethod
+    def _normalize_claim_text(claim_text: str) -> str:
+        return " ".join(claim_text.split()).casefold()
+
+    @staticmethod
+    def _ensure_claim_provenance(claim: Claim) -> None:
+        if not claim.source_provenance:
+            claim.source_provenance.append({
+                "agent_id": claim.originating_agent,
+                "role": claim.originating_role,
+                "subtask_id": claim.subtask_id,
+            })
+
+    @classmethod
+    def _merge_claim(cls, existing: Claim, incoming: Claim) -> None:
+        cls._ensure_claim_provenance(existing)
+        cls._ensure_claim_provenance(incoming)
+        for source in incoming.source_provenance:
+            if source not in existing.source_provenance:
+                existing.source_provenance.append(source)
+        for assumption in incoming.assumptions:
+            if assumption not in existing.assumptions:
+                existing.assumptions.append(assumption)
+        for evidence_id in incoming.evidence_references:
+            if evidence_id not in existing.evidence_references:
+                existing.evidence_references.append(evidence_id)
+        if not existing.supporting_reasoning and incoming.supporting_reasoning:
+            existing.supporting_reasoning = incoming.supporting_reasoning
 
     async def register_evidence(
         self,
@@ -117,7 +175,12 @@ class EvidenceLedger:
         review_decisions: Optional[List[ReviewFeedback]] = None,
         repair_history: Optional[List[RepairAttempt]] = None,
     ) -> VerificationReport:
-        """Synthesize a complete verification audit report."""
+        """Synthesize a complete verification audit report with rigorous support rate calculation.
+
+        Support Rate Formula:
+        Supported / (Supported + Rejected + Needs Revision + Unverifiable) * 100
+        Excludes unreviewed/pending claims. Avoids division by zero on empty collections.
+        """
         async with self._lock:
             claims = list(self._claims.values())
             total = len(claims)
@@ -125,15 +188,44 @@ class EvidenceLedger:
             rejected = [c for c in claims if c.status == ClaimStatus.REJECTED]
             needs_rev = [c for c in claims if c.status == ClaimStatus.NEEDS_REVISION]
             unverifiable = [c for c in claims if c.status == ClaimStatus.UNVERIFIABLE]
+            unreviewed = [c for c in claims if c.status in (ClaimStatus.PENDING, ClaimStatus.UNREVIEWED)]
 
-            support_rate = round(len(accepted) / total, 3) if total > 0 else 0.0
-            unsupported_rate = round((len(rejected) + len(unverifiable)) / total, 3) if total > 0 else 0.0
+            # Denominator: strictly reviewed claims (excluding PENDING and UNREVIEWED)
+            reviewed_claims = [
+                c for c in claims
+                if c.status in (
+                    ClaimStatus.SUPPORTED,
+                    ClaimStatus.REJECTED,
+                    ClaimStatus.NEEDS_REVISION,
+                    ClaimStatus.UNVERIFIABLE,
+                )
+            ]
+            reviewed_count = len(reviewed_claims)
+
+            if reviewed_count > 0:
+                support_rate = round((len(accepted) / reviewed_count) * 100.0, 1)
+                unsupported_rate = round(((len(rejected) + len(unverifiable)) / reviewed_count) * 100.0, 1)
+            else:
+                support_rate = None
+                unsupported_rate = None
 
             repairs = repair_history or []
             successful_repairs = sum(1 for r in repairs if r.status == ClaimStatus.SUPPORTED)
             repair_success_rate = (
-                round(successful_repairs / len(repairs), 3) if repairs else 0.0
+                round((successful_repairs / len(repairs)) * 100.0, 1) if repairs else 0.0
             )
+
+            if total == 0:
+                summary_msg = "No claims were available for verification; support rate is unavailable."
+            elif reviewed_count == 0:
+                summary_msg = (
+                    f"No claims were reviewed; support rate is unavailable. "
+                    f"{len(unreviewed)} claim(s) remain unreviewed."
+                )
+            else:
+                summary_msg = f"{len(accepted)} of {reviewed_count} reviewed claims supported ({support_rate:.1f}%)."
+                if unreviewed:
+                    summary_msg += f" {len(unreviewed)} claim(s) unreviewed due to audit interruption."
 
             return VerificationReport(
                 total_claims=total,
@@ -141,11 +233,13 @@ class EvidenceLedger:
                 rejected_claims=rejected,
                 needs_revision_claims=needs_rev,
                 unverifiable_claims=unverifiable,
+                unreviewed_claims=unreviewed,
                 review_decisions=review_decisions or [],
                 repair_history=repairs,
                 support_rate=support_rate,
                 unsupported_rate=unsupported_rate,
                 repair_success_rate=repair_success_rate,
+                summary_message=summary_msg,
             )
 
     async def clear(self) -> None:
@@ -154,4 +248,3 @@ class EvidenceLedger:
             self._claims.clear()
             self._evidence.clear()
             self._claim_evidence_map.clear()
-

@@ -1,12 +1,13 @@
 # MEDHA — Multi-Agent Evidence-Driven Architecture
 
 [![Python 3.13](https://img.shields.io/badge/python-3.13-blue.svg)](https://www.python.org/)
-[![Google Gemini API](https://img.shields.io/badge/LLM-Google%20Gemini-orange.svg)](https://ai.google.dev/)
-[![Tests](https://img.shields.io/badge/tests-34%20passed-brightgreen.svg)]()
+[![Groq API](https://img.shields.io/badge/Primary%20LLM-Groq-green.svg)](https://groq.com/)
+[![Google Gemini API](https://img.shields.io/badge/Alternative%20LLM-Google%20Gemini-orange.svg)](https://ai.google.dev/)
+[![Tests](https://img.shields.io/badge/tests-53%20passed-brightgreen.svg)]()
 [![Model Context Protocol](https://img.shields.io/badge/MCP-2.3.0-purple.svg)](https://modelcontextprotocol.io/)
 
 **SEED Hackathon 2026** | **Problem Statement 02 — Chain of Command**  
-*Topic-Independent, Dynamically Orchestrated Multi-Agent Intelligence with Adversarial Evidence Auditing*
+*Topic-Independent, Dynamically Orchestrated Multi-Agent Intelligence with Multi-Provider Architecture & Adversarial Evidence Auditing*
 
 ---
 
@@ -18,14 +19,15 @@ Traditional LLM workflows and naive multi-agent systems suffer from common failu
 3. **Rigid Predefined Roles**: Fixed agent configurations struggle when encountering novel, multi-disciplinary problems.
 4. **All-or-Nothing Rejection**: When an answer contains a single flaw, the entire output is either rejected or accepted with the flaw intact.
 
-**MEDHA** solves these fundamental issues through a dynamic, evidence-grounded architecture:
+**MEDHA** solves these fundamental issues through a dynamic, evidence-grounded multi-provider architecture:
+- **Multi-Provider LLM Architecture**: Uses **Groq** (`openai/gpt-oss-20b`) as its high-speed primary LLM provider while retaining **Google Gemini** (`gemini-3.8-flash`) as a fully supported alternative.
 - **Dynamic Specialist Creation**: Analyzes each user task to dynamically determine the exact domain expertise required and creates custom specialist agents on the fly.
 - **Dependency-Aware Parallel Execution**: Automatically derives DAG dependencies, executing independent specialist subtasks concurrently while routing upstream findings to downstream specialists.
 - **Structured Inter-Agent Message Bus**: Agents exchange formal findings, questions, evidence, and challenges across dedicated asynchronous inboxes.
 - **Centralized Evidence Ledger**: Rigorously indexes every concrete assertion as an atomic claim tied to verified supporting evidence and source references.
 - **Independent Adversarial Reviewer**: Audits claims using strict evidentiary criteria (challenging unverified leaps, superlatives, and hidden assumptions) rather than consensus.
 - **Targeted Precision Repair**: Routes specific reviewer critiques back to the responsible specialist to narrow claims, declare explicit assumptions, or supply valid derivations.
-- **Transparent Final Synthesis**: Assembles accepted findings, explicitly discloses excluded/rejected claims, highlights open caveats, and maintains full evidentiary traceability.
+- **Transparent Truthful Execution**: Reports truthful statuses (`SUCCESS`, `PARTIAL_FAILURE`, `FAILED`), explicitly discloses when zero claims were available for verification, and never presents unverified fallback text as truth.
 - **Full Model Context Protocol (MCP) Server**: Exposes MEDHA tools over the official MCP Python SDK for seamless integration into external agent environments.
 - **Quantitative Benchmarking Suite**: Evaluates MEDHA against a single-agent baseline on reference criteria coverage, claim support rates, repair efficiency, and token economics.
 
@@ -65,7 +67,7 @@ flowchart TD
     end
 
     Accepted & Unverifiable --> Synthesizer[Final Synthesizer]
-    Synthesizer --> FinalAnswer([Transparent Synthesized Answer])
+    Synthesizer --> FinalAnswer([Transparent Truthful Answer])
 ```
 
 ---
@@ -76,17 +78,21 @@ flowchart TD
 MEDHA/
 │
 ├── main.py                     # Interactive CLI and application entry point
-├── requirements.txt            # Project dependencies
-├── .env                        # Local configuration and credentials
-├── .env.example                # Example environment configuration
+├── requirements.txt            # Project dependencies (groq, google-genai, pydantic, mcp)
+├── .env                        # Local configuration and credentials (never committed)
+├── .env.example                # Example multi-provider environment configuration
 ├── .gitignore                  # Git ignore rules
 │
 ├── config/
-│   ├── settings.py             # Environment configuration and validation
+│   ├── settings.py             # Multi-provider environment configuration & validation
 │   └── logging_config.py       # Credential-redacting structured logging
 │
 ├── core/
-│   ├── llm_client.py           # Reusable async Gemini client with retries
+│   ├── llm_client.py           # Provider factory & global singleton manager
+│   ├── providers/
+│   │   ├── base.py             # BaseLLMClient abstract base class
+│   │   ├── groq_client.py      # Groq implementation (AsyncGroq, JSON mode, retry, tokens)
+│   │   └── gemini_client.py    # Google Gemini implementation (google.genai, retries)
 │   ├── orchestrator.py         # Master workflow controller & execution manager
 │   ├── planner.py              # Dynamic task planner & role decomposer
 │   ├── agent_factory.py        # Dynamic agent creation & role routing
@@ -138,17 +144,17 @@ MEDHA/
 ├── utils/
 │   ├── helpers.py              # ID generators, JSON sanitizers, timestamps
 │   ├── logger.py               # Structured ExecutionRecord and file logger
-│   ├── retry.py                # Exponential backoff with jitter and error typing
+│   ├── retry.py                # Exponential backoff, jitter, Retry-After & quota classification
 │   └── token_tracker.py        # Thread-safe token consumption accumulator
 │
 ├── tests/
-│   ├── test_settings.py        # Configuration and validation tests
-│   ├── test_llm_client.py      # Gemini client, retry, and token tracking tests
+│   ├── test_settings.py        # Multi-provider configuration & validation tests
+│   ├── test_llm_client.py      # Groq, Gemini, retries, quota exhaustion, tokens
 │   ├── test_agent_factory.py   # Dynamic agent creation and planning tests
 │   ├── test_message_bus.py     # Message bus routing and concurrency tests
 │   ├── test_verification.py    # Claim extraction, ledger, and auditing tests
 │   ├── test_repair.py          # Targeted repair and re-review tests
-│   ├── test_orchestrator.py    # End-to-end orchestration tests
+│   ├── test_orchestrator.py    # Truthful execution status (SUCCESS, PARTIAL, FAILED) tests
 │   ├── test_mcp.py             # MCP server tool execution tests
 │   └── test_benchmark.py       # Benchmark evaluation and metric tests
 │
@@ -161,7 +167,7 @@ MEDHA/
 
 ### Prerequisites
 - Python 3.13+
-- Active Google Gemini API Key
+- Active **Groq API Key** (Primary) and/or **Google Gemini API Key** (Alternative)
 
 ### Installation
 
@@ -169,20 +175,30 @@ MEDHA/
    ```powershell
    .\.venv\Scripts\Activate.ps1
    ```
+   *(If script execution is restricted on Windows, run `Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser`)*
 
 2. **Install dependencies**:
    ```powershell
    pip install -r requirements.txt
    ```
 
-3. **Configure credentials**:
-   Ensure `.env` contains your Gemini API key:
+3. **Configure credentials in `.env`**:
+   Copy `.env.example` to `.env` and configure your chosen provider:
+
+   **Primary Provider — Groq (Default):**
+   ```env
+   LLM_PROVIDER=groq
+   GROQ_API_KEY=gsk_your_groq_api_key_here
+   GROQ_MODEL=openai/gpt-oss-20b
+   TEMPERATURE=0.2
+   ```
+
+   **Alternative Provider — Google Gemini:**
    ```env
    LLM_PROVIDER=gemini
    GEMINI_API_KEY=your_gemini_api_key_here
    GEMINI_MODEL=gemini-3.8-flash
-   APP_ENV=development
-   LOG_LEVEL=INFO
+   TEMPERATURE=0.2
    ```
 
 ---
@@ -190,60 +206,49 @@ MEDHA/
 ## 5. Usage
 
 ### 1. Interactive Command Line Interface
-
 Launch the interactive MEDHA assistant:
 ```powershell
 python main.py
 ```
 
-Enter your task prompt when requested:
-```
-Enter your task:
-> Design a resilient multi-region database architecture with sub-10ms reads.
-```
-
-MEDHA will step through:
-1. Dynamic planning and role selection
-2. Parallel specialist agent execution
-3. Inter-agent communication
-4. Discrete claim extraction
-5. Adversarial evidence auditing
-6. Precision repair of flagged claims
-7. Final synthesis with execution statistics
-
 ### 2. Direct Task Execution
-
-Run a single task directly via CLI arguments:
+Run a single task directly via CLI:
 ```powershell
 python main.py --task "Design a high-throughput financial ledger processing 100k TPS."
 ```
 
 ### 3. Single-Agent Baseline
-
-Run a task using the un-orchestrated single-agent baseline for comparison:
+Run a task using the un-orchestrated single-agent baseline for direct comparison:
 ```powershell
 python main.py --baseline "Design a high-throughput financial ledger processing 100k TPS."
 ```
 
 ### 4. Quantitative Benchmark Suite
-
-Run the full comparative benchmark suite across technical reasoning, software architecture, analytical reasoning, logical reasoning, and general knowledge:
+Run the comparative benchmark suite evaluating MEDHA against the single-agent baseline:
 ```powershell
 python main.py --benchmark
 ```
-
-Output reports will be generated at:
+Output reports will be exported to:
 - `benchmark/benchmark_report.json`
 - `benchmark/benchmark_results.csv`
 
-### 5. Model Context Protocol (MCP) Server
+#### Benchmark Status and Protocol
 
-Start MEDHA as a standard MCP server over stdio for integration into Claude Code, Antigravity, or other MCP-compliant hosts:
+The current benchmark is exploratory; its results do not establish that MEDHA is superior to a single agent. Before drawing that conclusion, a controlled comparison must use identical prompts and evaluation criteria, the same provider/model version and temperature, and a documented, comparable per-task token budget. The current runner does not enforce matching injected runner configurations or equal total-token budgets. Its lexical reference-criteria and pitfall matching is not a blinded quality assessment, and claim-support statistics are produced for MEDHA but not independently for the baseline. Cost estimates also need provider- and model-specific pricing rather than a fixed Gemini rate.
+
+For live validation, first confirm provider quota in its console, then run a small two- or three-specialist task. Compare discovered, deduplicated/registered, capacity-rejected, reviewed, and unreviewed claims. Include deliberately unsupported empirical claims and confirm they are not accepted without external evidence. Run the larger attendance-system task only after the smaller run completes successfully. Do not treat a successful mocked test as evidence of live provider behavior.
+
+Known limitations to retain when interpreting results:
+- Token estimates are byte-based approximations, not exact provider token counts. When usage is unavailable, MEDHA conservatively charges the reservation estimate; this may overstate consumption.
+- Claim-kind classification is heuristic and can miss unusual or misleading phrasing, including performance targets framed as implied measurements. It should be evaluated against a deliberately constructed difficult-claims set.
+- Neither limitation has been validated against live provider behavior, and MEDHA cannot observe usage from other applications sharing the provider account.
+
+### 5. Model Context Protocol (MCP) Server
+Start MEDHA as a standard MCP server over stdio:
 ```powershell
 python main.py --mcp
 ```
-
-Exposed MCP Tools:
+Exposed Tools:
 - `run_medha_task(task: str, max_concurrency: int = 4, max_repair_iterations: int = 2)`
 - `get_execution_status(execution_id: str)`
 - `get_verification_report(execution_id: str)`
@@ -251,40 +256,45 @@ Exposed MCP Tools:
 
 ---
 
-## 6. Verification and Auditing Principles
+## 6. Truthful Execution Statuses
 
-MEDHA adheres to uncompromising reliability standards:
-- **No Agent Consensus as Proof**: Multiple agents agreeing on a claim does not constitute evidence. Only independent grounding or valid deductive derivation satisfies the auditor.
-- **No Hallucinated Citations**: The system explicitly forbids inventing fake paper titles, URLs, or empirical statistics.
-- **Superlative Detection**: The heuristic validator automatically flags claims containing unverified absolutes (`100% secure`, `zero latency`, `impossible to fail`).
-- **Preserved Uncertainty**: If evidence is missing and a claim cannot be verified within the maximum repair cycles, it is marked `UNVERIFIABLE` and transparently disclosed as an unconfirmed hypothesis rather than forced as truth.
-- **Traceable Synthesis**: Every factual recommendation in the final output is traceable back to accepted claims in the Evidence Ledger.
+MEDHA introduces truthful execution reporting to eliminate phantom successes:
+- **`SUCCESS`**: All specialist agents completed successfully, and their extracted claims were verified.
+- **`PARTIAL_FAILURE`**: At least one specialist agent succeeded while others encountered errors. Valid findings are synthesized with transparent disclosure of failed components.
+- **`FAILED`**: Zero specialist subtasks completed successfully. The workflow terminates with a transparent failure report detailing subtask errors and explicitly stating that no claims were available for verification. Fallback text is **never** presented as verified truth.
 
 ---
 
-## 7. Automated Testing
+## 7. Rate Limiting, Retries, and Quota Troubleshooting
 
-MEDHA includes comprehensive automated unit and integration tests for every module. **All unit tests use mocked LLM responses** to ensure zero unwanted API charges and 100% reproducibility.
+MEDHA's resilient retry engine ([`utils/retry.py`](file:///C:/MEDHA/utils/retry.py)) differentiates between transient rate limits and daily quota limits:
+
+| Error Type | Status Code | Classification | Behavior |
+| :--- | :--- | :--- | :--- |
+| **Transient Rate Limit (RPM / TPM)** | `429` | Retryable (`LLMRateLimitError`) | Backs off exponentially with jitter and honors `Retry-After` headers for short delays. |
+| **Daily / Monthly Quota Limit (RPD)** | `429` | Non-retryable (`LLMQuotaExhaustedError`) | Fails immediately with clear diagnostic guidance. Does **not** retry or hang for 18 hours. |
+| **Authentication / Permission** | `401` / `403` | Non-retryable (`LLMAuthError`) | Fails immediately. Check your `GROQ_API_KEY` or `GEMINI_API_KEY` in `.env`. |
+| **Invalid / Unavailable Model** | `404` | Non-retryable (`LLMModelNotFoundError`) | Fails immediately. Verify `GROQ_MODEL` or `GEMINI_MODEL` spelling. |
+| **Temporary Server Failure** | `500` / `502` / `503` / `504` | Retryable (`LLMServerError`) | Automatically retries up to `MAX_RETRIES=3` with exponential backoff. |
+| **Network Timeout** | `408` / `Timeout` | Retryable (`LLMTimeoutError`) | Retries with backoff up to `EXECUTION_TIMEOUT_SECONDS=180.0`. |
+
+---
+
+## 8. Automated Testing
+
+All unit tests use mock responses to ensure zero external API charges during testing.
 
 Run the test suite:
 ```powershell
-python -m pytest tests/ -v
+.\.venv\Scripts\pytest -v
 ```
 
-Test Coverage Summary:
-- `tests/test_settings.py`: Configuration loading, validation, and boundary conditions.
-- `tests/test_llm_client.py`: Async generation, Pydantic structured output, exponential backoff retries, error categorization (400, 401, 404, 429, 500), and token tracking.
-- `tests/test_agent_factory.py`: Dynamic specialist creation, role-based subclass routing, and plan generation fallback.
-- `tests/test_message_bus.py`: Queue-based inboxes, direct vs broadcast routing, thread-safe shared context, and dependency scheduling.
-- `tests/test_verification.py`: Claim extraction, EvidenceLedger lifecycle, superlative heuristic detection, and adversarial claim reviews.
-- `tests/test_repair.py`: Targeted repair loops, agent re-prompting, re-auditing, and uncertainty preservation.
-- `tests/test_orchestrator.py`: Full end-to-end 6-stage lifecycle execution and error resilience.
-- `tests/test_mcp.py`: MCP tool invocations, execution cache lookup, and schema serialization.
-- `tests/test_benchmark.py`: Metric calculation, criteria evaluation, and report export.
+```
+============================= 53 passed in 4.03s ==============================
+```
 
 ---
 
-## 8. License
+## 9. License
 
-Developed for the **SEED Hackathon 2026**. Built with Python 3.13 and the official Google GenAI SDK.
-
+Developed for the **SEED Hackathon 2026** — Problem Statement 02 (Chain of Command).

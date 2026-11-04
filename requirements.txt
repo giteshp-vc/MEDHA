@@ -4,6 +4,9 @@ python-dotenv
 # Google Gemini API
 google-genai
 
+# Groq API
+groq
+
 # Data validation and structured models
 pydantic
 

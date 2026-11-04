@@ -65,6 +65,24 @@ def test_compute_system_metrics_calculation():
     assert metrics.estimated_cost_usd > 0.0
 
 
+def test_system_metrics_keep_unreviewed_support_rate_undefined():
+    result = TaskEvaluationResult(
+        task_id="unreviewed",
+        domain="Tech",
+        mode="MEDHA",
+        prompt="Prompt",
+        answer="Answer",
+        success=False,
+        duration_seconds=1.0,
+        verification_stats={"support_rate": None, "unsupported_rate": None},
+    )
+
+    metrics = compute_system_metrics("MEDHA", [result])
+
+    assert metrics.claim_support_rate is None
+    assert metrics.unsupported_claim_rate is None
+
+
 def test_evaluate_answer_criteria_matching():
     """Verify evaluation matches reference criteria and identifies pitfalls."""
     evaluator = BenchmarkEvaluator()

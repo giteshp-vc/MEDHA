@@ -49,10 +49,19 @@ class ClaimStatus(str, Enum):
     """Verification status of a claim in the evidence ledger."""
 
     PENDING = "PENDING"
+    UNREVIEWED = "UNREVIEWED"
     SUPPORTED = "SUPPORTED"
     REJECTED = "REJECTED"
     NEEDS_REVISION = "NEEDS_REVISION"
     UNVERIFIABLE = "UNVERIFIABLE"
+
+
+class ClaimKind(str, Enum):
+    FACTUAL_ASSERTION = "FACTUAL_ASSERTION"
+    PROPOSED_TARGET = "PROPOSED_TARGET"
+    EMPIRICAL_RESULT = "EMPIRICAL_RESULT"
+    ASSUMPTION = "ASSUMPTION"
+    RECOMMENDATION = "RECOMMENDATION"
 
 
 class VerificationDecision(str, Enum):
@@ -65,11 +74,12 @@ class VerificationDecision(str, Enum):
 
 
 class EvidenceSourceType(str, Enum):
-    """Source classification for pieces of evidence."""
+    """Source classification for pieces of evidence with clear provenance boundaries."""
 
-    USER_INPUT = "USER_INPUT"
-    TOOL_RETRIEVED = "TOOL_RETRIEVED"
-    REASONING_INFERENCE = "REASONING_INFERENCE"
-    DOMAIN_KNOWLEDGE = "DOMAIN_KNOWLEDGE"
-    BENCHMARK_DATA = "BENCHMARK_DATA"
-
+    USER_INPUT = "USER_INPUT"  # Legacy/general user prompt text (treated as user statement)
+    USER_ASSERTION = "USER_ASSERTION"  # Plain user assertion or subjective claim in prompt
+    USER_PROVIDED_ARTIFACT = "USER_PROVIDED_ARTIFACT"  # Uploaded file, benchmark report, schema, log, or dataset
+    TOOL_RETRIEVED = "TOOL_RETRIEVED"  # Retrieved via tool/API/DB/search with traceability
+    REASONING_INFERENCE = "REASONING_INFERENCE"  # Internal model deduction or specialist derivation
+    DOMAIN_KNOWLEDGE = "DOMAIN_KNOWLEDGE"  # Internal LLM pretraining knowledge
+    BENCHMARK_DATA = "BENCHMARK_DATA"  # Empirically measured test or benchmark data

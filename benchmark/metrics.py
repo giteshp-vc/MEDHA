@@ -38,8 +38,8 @@ class SystemMetrics(BaseSchema):
     total_tokens: int = 0
     avg_tokens_per_task: float = 0.0
     total_api_requests: int = 0
-    claim_support_rate: float = 0.0
-    unsupported_claim_rate: float = 0.0
+    claim_support_rate: Optional[float] = None
+    unsupported_claim_rate: Optional[float] = None
     reviewer_rejection_rate: float = 0.0
     repair_success_rate: float = 0.0
     reference_criteria_coverage: float = 0.0
@@ -71,16 +71,16 @@ def compute_system_metrics(
 
     # Verification specific rates (relevant for MEDHA)
     all_support_rates = [
-        r.verification_stats.get("support_rate", 0.0)
-        for r in results if r.verification_stats
+        r.verification_stats.get("support_rate")
+        for r in results if r.verification_stats and r.verification_stats.get("support_rate") is not None
     ]
-    avg_support_rate = round(sum(all_support_rates) / len(all_support_rates), 3) if all_support_rates else 0.0
+    avg_support_rate = round(sum(all_support_rates) / len(all_support_rates), 3) if all_support_rates else None
 
     all_unsupported_rates = [
-        r.verification_stats.get("unsupported_rate", 0.0)
-        for r in results if r.verification_stats
+        r.verification_stats.get("unsupported_rate")
+        for r in results if r.verification_stats and r.verification_stats.get("unsupported_rate") is not None
     ]
-    avg_unsupported_rate = round(sum(all_unsupported_rates) / len(all_unsupported_rates), 3) if all_unsupported_rates else 0.0
+    avg_unsupported_rate = round(sum(all_unsupported_rates) / len(all_unsupported_rates), 3) if all_unsupported_rates else None
 
     all_repair_rates = [
         r.verification_stats.get("repair_success_rate", 0.0)

@@ -1,9 +1,10 @@
 from typing import Any, Dict, List, Optional
 
-from core.llm_client import GeminiClient
+from core.llm_client import BaseLLMClient, LLMClient
 from models.task_models import SubTask, TaskPlan
 from utils.helpers import parse_json_safely
 from utils.logger import get_logger
+from utils.retry import LLMBudgetExceededError, LLMQuotaExhaustedError
 
 logger = get_logger("planner")
 
@@ -16,6 +17,8 @@ PLANNER_SYSTEM_PROMPT = (
     "strictly to the domain of the input prompt (e.g. cybersecurity, distributed databases, pharmacology, "
     "compiler design, macroeconomic policy, frontend accessibility, etc.).\n"
     "2. PARALLELISM & DEPENDENCIES: Independent subtasks MUST have empty dependencies ('[]') so they execute in parallel.\n"
+    "Add a dependency only when the subtask cannot produce a useful, independent result without a specific earlier output; shared topic or broad architecture scope is not a dependency.\n"
+    "Default architecture, privacy, security, reliability, and deployment reviews of an attendance system to independent execution; add a dependency only when the objective explicitly requires a named upstream artifact.\n"
     "Subtasks that strictly rely on earlier findings must list the specific subtask IDs (e.g. ['T1', 'T2']) in 'dependencies'.\n"
     "3. SCOPE: Generate between 2 to 5 highly relevant subtasks.\n"
     "4. COMPLETION CRITERIA: Define explicit, measurable conditions for full task resolution."
@@ -25,8 +28,8 @@ PLANNER_SYSTEM_PROMPT = (
 class TaskPlanner:
     """Decomposes user tasks dynamically into specialist subtasks with dependency graphs."""
 
-    def __init__(self, llm_client: Optional[GeminiClient] = None):
-        self.client = llm_client or GeminiClient.get_instance()
+    def __init__(self, llm_client: Optional[BaseLLMClient] = None):
+        self.client = llm_client or LLMClient.get_instance()
 
     async def create_plan(
         self,
@@ -69,6 +72,8 @@ class TaskPlanner:
             )
             return plan
 
+        except (LLMBudgetExceededError, LLMQuotaExhaustedError):
+            raise
         except Exception as e:
             logger.warning(f"Structured plan generation failed ({e}); attempting text fallback...")
             try:

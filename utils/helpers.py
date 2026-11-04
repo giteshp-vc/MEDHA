@@ -17,19 +17,39 @@ def utcnow_iso() -> str:
 
 
 def sanitize_json_text(raw_text: str) -> str:
-    """Strip markdown code fence blocks from text to extract raw JSON."""
+    """Extract the contents of a Markdown code fence when one is present."""
     text = raw_text.strip()
-    if text.startswith("```"):
-        # Match ```json or ``` at start and ``` at end
-        pattern = r"^```(?:json)?\s*\n?(.*?)\n?```$"
-        match = re.match(pattern, text, re.DOTALL)
-        if match:
-            text = match.group(1).strip()
+    match = re.search(r"```(?:json)?\s*(.*?)```", text, re.IGNORECASE | re.DOTALL)
+    if match:
+        text = match.group(1).strip()
     return text
 
 
 def parse_json_safely(raw_text: str) -> Dict[str, Any]:
-    """Parse JSON text safely, handling optional markdown code fences and whitespace."""
+    """Parse a JSON object, including one embedded in prose or a Markdown fence."""
     clean_text = sanitize_json_text(raw_text)
-    return json.loads(clean_text)
+    if not clean_text:
+        raise ValueError("Empty response: no JSON object was provided.")
+
+    decoder = json.JSONDecoder()
+    try:
+        parsed = json.loads(clean_text)
+        if isinstance(parsed, dict):
+            return parsed
+    except json.JSONDecodeError as error:
+        original_error = error
+    else:
+        original_error = ValueError("The JSON response must be an object.")
+
+    for index, character in enumerate(clean_text):
+        if character != "{":
+            continue
+        try:
+            parsed, _ = decoder.raw_decode(clean_text, index)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+
+    raise ValueError(f"No valid JSON object found: {original_error}") from original_error
 

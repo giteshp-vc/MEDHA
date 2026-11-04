@@ -11,8 +11,36 @@ from core.task_manager import TaskManager
 from models.schemas import MessageType, TaskStatus
 from models.task_models import SubTask, TaskPlan, TaskResult
 from utils.logger import get_logger
+from utils.retry import (
+    LLMBudgetExceededError,
+    LLMError,
+    LLMQuotaExhaustedError,
+    LLMStructuredOutputError,
+)
 
 logger = get_logger("execution_engine")
+
+
+def _describe_exception(error: Exception) -> str:
+    description = f"{type(error).__name__}: {error}"
+    original = error.__cause__
+    if original is not None:
+        description += f" (original {type(original).__name__}: {original})"
+    return description
+
+
+def _format_subtask_error(error: Exception, subtask_id: str) -> str:
+    if isinstance(error, (LLMBudgetExceededError, LLMQuotaExhaustedError)):
+        category = "Budget/quota interruption"
+    elif isinstance(error, LLMStructuredOutputError):
+        category = "Structured output validation failure"
+    elif error.__class__.__name__ == "SpecialistOutputRecoveryError":
+        category = "Structured output recovery failure"
+    elif isinstance(error, LLMError):
+        category = "Provider/API failure"
+    else:
+        category = "Specialist execution failure"
+    return f"{category} [subtask {subtask_id}]: {_describe_exception(error)}"
 
 
 class ExecutionEngine:
@@ -49,12 +77,20 @@ class ExecutionEngine:
             elapsed = time.perf_counter() - start_time
             if elapsed > self.timeout_seconds:
                 logger.error(f"ExecutionEngine exceeded global timeout of {self.timeout_seconds}s. Halting.")
+                task_manager.fail_pending_subtasks(
+                    f"global execution timeout exceeded ({self.timeout_seconds}s)"
+                )
                 break
 
             ready_subtasks = task_manager.get_ready_subtasks()
             if not ready_subtasks:
                 if not task_manager.is_all_finished():
-                    logger.warning("No subtasks currently ready but unfinished subtasks remain. Breaking to prevent deadlock.")
+                    blocked = task_manager.block_unrunnable_subtasks()
+                    logger.warning(
+                        "No runnable subtasks remain; recorded %d dependency-blocked task(s).",
+                        len(blocked),
+                    )
+                    continue
                 break
 
             logger.info(
@@ -91,7 +127,7 @@ class ExecutionEngine:
                         role=subtask.role,
                         status=TaskStatus.FAILED,
                         output="",
-                        error=str(outcome),
+                        error=_format_subtask_error(outcome, subtask.id),
                     )
                     task_manager.record_result(failed_res)
                 elif isinstance(outcome, TaskResult):
@@ -171,6 +207,7 @@ class ExecutionEngine:
                     output=response.content,
                     findings=response.findings,
                     claims=response.claims,
+                    evidence_items=[{"reference": ref, "source": "agent_reasoning"} for ref in response.evidence_references],
                     assumptions=response.assumptions,
                     unresolved_questions=response.unresolved_questions,
                     duration_seconds=duration,
@@ -185,7 +222,7 @@ class ExecutionEngine:
                     role=agent.role,
                     status=TaskStatus.FAILED,
                     output="",
-                    error=str(e),
+                    error=_format_subtask_error(e, subtask.id),
                     duration_seconds=duration,
                 )
 

@@ -8,7 +8,7 @@ from agents.reviewer_agent import ReviewerAgent
 from agents.specialist_agent import SpecialistAgent
 from agents.synthesizer_agent import SynthesizerAgent
 from agents.technical_agent import TechnicalAgent
-from core.llm_client import GeminiClient
+from core.llm_client import BaseLLMClient, LLMClient
 from models.agent_models import AgentConfig
 from models.task_models import SubTask
 from utils.helpers import generate_id
@@ -20,8 +20,8 @@ logger = get_logger("agent_factory")
 class AgentFactory:
     """Factory responsible for dynamically instantiating, configuring, and tracking specialist agents."""
 
-    def __init__(self, llm_client: Optional[GeminiClient] = None):
-        self.client = llm_client or GeminiClient.get_instance()
+    def __init__(self, llm_client: Optional[BaseLLMClient] = None):
+        self.client = llm_client or LLMClient.get_instance()
         self._registry: Dict[str, BaseAgent] = {}
         self._role_map: Dict[str, str] = {}  # (role, subtask_id) -> agent_id to prevent duplicates
 
