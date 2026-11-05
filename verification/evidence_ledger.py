@@ -94,6 +94,9 @@ class EvidenceLedger:
         for evidence_id in incoming.evidence_references:
             if evidence_id not in existing.evidence_references:
                 existing.evidence_references.append(evidence_id)
+        for reference in incoming.unverified_evidence_references:
+            if reference not in existing.unverified_evidence_references:
+                existing.unverified_evidence_references.append(reference)
         if not existing.supporting_reasoning and incoming.supporting_reasoning:
             existing.supporting_reasoning = incoming.supporting_reasoning
 

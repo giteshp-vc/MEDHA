@@ -32,6 +32,7 @@ class AdversarialReviewer:
         ledger: EvidenceLedger,
         task_context: str = "",
         target_claims: Optional[List[Claim]] = None,
+        deliberation_context: str = "",
     ) -> List[ReviewFeedback]:
         """Perform adversarial auditing on pending or target claims in the ledger in configurable batches."""
         claims_to_review = (
@@ -55,11 +56,17 @@ class AdversarialReviewer:
                 evidence_by_claim[claim.claim_id] = await ledger.get_evidence_for_claim(claim.claim_id)
 
             # Audit batch in single structured LLM call
-            batch_feedbacks = await self.reviewer_agent.evaluate_claims_batch(
-                claims=batch,
-                evidence_by_claim=evidence_by_claim,
-                task_context=task_context,
-            )
+            with self.client.get_token_tracker().call_context(
+                agent_id=self.reviewer_agent.agent_id,
+                agent_role=self.reviewer_agent.role,
+                stage="verification",
+            ):
+                batch_feedbacks = await self.reviewer_agent.evaluate_claims_batch(
+                    claims=batch,
+                    evidence_by_claim=evidence_by_claim,
+                    task_context=task_context,
+                    deliberation_context=deliberation_context,
+                )
 
             feedbacks_map = {fb.claim_id: fb for fb in batch_feedbacks}
 
@@ -141,12 +148,14 @@ class AdversarialReviewer:
         claim: Claim,
         ledger: EvidenceLedger,
         task_context: str = "",
+        deliberation_context: str = "",
     ) -> ReviewFeedback:
         """Audit an individual claim against its registered evidence (backward compatibility)."""
         results = await self.review_claims(
             ledger=ledger,
             task_context=task_context,
             target_claims=[claim],
+            deliberation_context=deliberation_context,
         )
         if results:
             return results[0]

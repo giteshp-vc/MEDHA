@@ -10,9 +10,15 @@ logger = get_logger("task_manager")
 class TaskManager:
     """Manages subtask lifecycle, dependency resolution, execution status, and collected results."""
 
-    def __init__(self, plan: TaskPlan, task_id: str = ""):
+    def __init__(
+        self,
+        plan: TaskPlan,
+        task_id: str = "",
+        honor_dependencies: bool = True,
+    ):
         self.task_id = task_id
         self.plan = plan
+        self.honor_dependencies = honor_dependencies
         self.subtasks: Dict[str, SubTask] = {s.id: s.model_copy() for s in plan.subtasks}
         self.results: Dict[str, TaskResult] = {}
         self.completed_subtask_ids: Set[str] = set()
@@ -20,6 +26,12 @@ class TaskManager:
 
     def get_ready_subtasks(self) -> List[SubTask]:
         """Return all subtasks whose dependencies have been successfully completed and are pending execution."""
+        if not self.honor_dependencies:
+            return [
+                subtask for subtask in self.subtasks.values()
+                if subtask.status == TaskStatus.PENDING
+            ]
+
         changed = True
         while changed:
             changed = False
@@ -31,14 +43,22 @@ class TaskManager:
                 unavailable = [
                     dep for dep in subtask.dependencies
                     if dep in self.subtasks
-                    and self.subtasks[dep].status in (TaskStatus.FAILED, TaskStatus.BLOCKED)
+                    and self.subtasks[dep].status in (
+                        TaskStatus.FAILED,
+                        TaskStatus.BLOCKED,
+                        TaskStatus.TIMED_OUT,
+                        TaskStatus.CANCELLED,
+                    )
                 ]
                 if missing or unavailable:
                     reasons = []
                     if missing:
                         reasons.append(f"unknown dependency ID(s): {', '.join(missing)}")
                     if unavailable:
-                        reasons.append(f"failed or blocked dependency ID(s): {', '.join(unavailable)}")
+                        reasons.append(
+                            f"failed, blocked, timed-out, or cancelled dependency ID(s): "
+                            f"{', '.join(unavailable)}"
+                        )
                     self._mark_blocked(subtask, "; ".join(reasons))
                     changed = True
 
@@ -112,9 +132,9 @@ class TaskManager:
         if result.status == TaskStatus.COMPLETED:
             self.completed_subtask_ids.add(subtask_id)
             logger.info(f"Subtask [{subtask_id}] marked COMPLETED.")
-        elif result.status == TaskStatus.FAILED:
+        elif result.status in (TaskStatus.FAILED, TaskStatus.TIMED_OUT, TaskStatus.CANCELLED):
             self.failed_subtask_ids.add(subtask_id)
-            logger.error(f"Subtask [{subtask_id}] marked FAILED ({result.error}).")
+            logger.error(f"Subtask [{subtask_id}] marked {result.status} ({result.error}).")
         elif result.status == TaskStatus.BLOCKED:
             logger.warning(f"Subtask [{subtask_id}] marked BLOCKED ({result.error}).")
 
@@ -137,8 +157,14 @@ class TaskManager:
         return upstream
 
     def is_all_finished(self) -> bool:
-        """Check if all subtasks have reached a terminal state (COMPLETED, FAILED, or BLOCKED)."""
-        terminal_states = {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.BLOCKED}
+        """Check if every subtask reached a completed, failed, blocked, timed-out, or cancelled state."""
+        terminal_states = {
+            TaskStatus.COMPLETED,
+            TaskStatus.FAILED,
+            TaskStatus.BLOCKED,
+            TaskStatus.TIMED_OUT,
+            TaskStatus.CANCELLED,
+        }
         return all(s.status in terminal_states for s in self.subtasks.values())
 
     def get_summary(self) -> Dict[str, Any]:

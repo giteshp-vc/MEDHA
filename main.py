@@ -1,12 +1,14 @@
 import argparse
 import asyncio
+import json
 import sys
 import time
+from pathlib import Path
 from typing import Any, Optional
 
 from benchmark.baseline import SingleAgentBaseline
 from benchmark.evaluator import BenchmarkEvaluator
-from config.settings import LLM_PROVIDER, validate_settings
+from config.settings import BENCHMARK_DIR, LLM_PROVIDER, validate_settings
 from core.orchestrator import MedhaOrchestrator
 from utils.logger import get_logger
 
@@ -129,15 +131,28 @@ async def run_single_task(task_text: str):
     print(f"Support Rate: {_format_rate(result.verification_report.get('support_rate', 0.0))}")
 
 
-async def run_benchmark_cli():
-    """Run comparative benchmark against single-agent baseline."""
+async def run_benchmark_cli(
+    max_cases: Optional[int] = None,
+    repetitions: int = 1,
+    experiment_id: Optional[str] = None,
+    output_directory: Optional[Path] = None,
+):
+    """Run the explicit four-arm benchmark experiment."""
     validate_settings()
-    print("\nStarting MEDHA Quantitative Benchmark against Single-Agent Baseline...")
+    print("\nStarting MEDHA four-arm benchmark experiment...")
     evaluator = BenchmarkEvaluator()
-    data = await evaluator.run_benchmark()
-    summary_md = BenchmarkEvaluator.generate_markdown_summary(data)
-    print("\n" + summary_md)
-    print("\nDetailed results saved to benchmark/benchmark_report.json and benchmark/benchmark_results.csv")
+    result = await evaluator.run_experiment(
+        max_cases=max_cases,
+        repetitions=repetitions,
+        experiment_id=experiment_id,
+        output_directory=output_directory,
+    )
+    print(json.dumps({
+        "experiment_id": result.experiment.experiment_id,
+        "aggregate_results": result.aggregate_results,
+        "actual_experiment_cost": result.actual_experiment_cost,
+        "exports": result.export_paths,
+    }, indent=2))
 
 
 def main():
@@ -155,8 +170,12 @@ def main():
         "--benchmark",
         "-b",
         action="store_true",
-        help="Run the quantitative benchmark suite comparing MEDHA to single-agent baseline",
+        help="Run the four-arm frozen-plan benchmark experiment",
     )
+    parser.add_argument("--benchmark-cases", type=int, help="Limit the number of dataset cases")
+    parser.add_argument("--benchmark-repetitions", type=int, default=1, help="Positive repetitions per case")
+    parser.add_argument("--experiment-id", type=str, help="Safe explicit ID used in benchmark export filenames")
+    parser.add_argument("--benchmark-output", type=Path, help="Output directory for experiment JSON and CSV")
     parser.add_argument(
         "--baseline",
         type=str,
@@ -170,11 +189,39 @@ def main():
 
     args = parser.parse_args()
 
+    if args.benchmark_repetitions < 1:
+        parser.error("--benchmark-repetitions must be positive")
+    if args.benchmark_cases is not None and args.benchmark_cases < 1:
+        parser.error("--benchmark-cases must be positive when supplied")
+    if args.experiment_id and (
+        not args.experiment_id[0].isalnum()
+        or any(char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-" for char in args.experiment_id)
+        or ".." in args.experiment_id
+        or len(args.experiment_id) > 128
+    ):
+        parser.error("--experiment-id must be a safe filename component (letters, digits, dot, underscore, hyphen)")
+    if args.benchmark_output is not None:
+        if ".." in args.benchmark_output.parts:
+            parser.error("--benchmark-output cannot contain parent-directory traversal")
+        if not args.benchmark_output.is_absolute():
+            args.benchmark_output = BENCHMARK_DIR / args.benchmark_output
+        try:
+            args.benchmark_output.resolve().relative_to(BENCHMARK_DIR.resolve())
+        except ValueError:
+            parser.error("--benchmark-output must remain inside the benchmark output directory")
+    if not args.benchmark and any((args.benchmark_cases is not None, args.experiment_id, args.benchmark_output is not None, args.benchmark_repetitions != 1)):
+        parser.error("benchmark options require --benchmark")
+
     if args.mcp:
         from mcp_server.server import main as mcp_main
         mcp_main()
     elif args.benchmark:
-        asyncio.run(run_benchmark_cli())
+        asyncio.run(run_benchmark_cli(
+            max_cases=args.benchmark_cases,
+            repetitions=args.benchmark_repetitions,
+            experiment_id=args.experiment_id,
+            output_directory=args.benchmark_output,
+        ))
     elif args.baseline:
         validate_settings()
         baseline = SingleAgentBaseline()

@@ -175,12 +175,17 @@ class RepairEngine:
         )
 
         try:
-            revision = await self.client.generate_structured(
-                prompt=prompt,
-                response_schema=ClaimRevisionOutput,
-                system_instruction=system_instruction,
-                temperature=0.2,
-            )
+            with self.client.get_token_tracker().call_context(
+                agent_id=claim.originating_agent,
+                agent_role=role,
+                stage="repair",
+            ):
+                revision = await self.client.generate_structured(
+                    prompt=prompt,
+                    response_schema=ClaimRevisionOutput,
+                    system_instruction=system_instruction,
+                    temperature=0.2,
+                )
 
             # Update the claim in the ledger
             claim.claim_text = revision.revised_claim_text

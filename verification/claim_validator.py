@@ -47,7 +47,7 @@ class ClaimValidator:
             if evidence_items is not None:
                 has_external_evidence = any(getattr(e, "is_external", False) for e in evidence_items)
             else:
-                has_external_evidence = bool(claim.evidence_references)
+                has_external_evidence = False
             if not has_external_evidence and not any("empirical" in issue for issue in issues):
                 issues.append(
                     "Claim is classified as an empirical result but has no external evidence artifact or test output."
@@ -69,9 +69,9 @@ class ClaimValidator:
                     has_external_evidence = any(
                         getattr(e, "is_external", False) for e in evidence_items
                     )
-                elif claim.evidence_references:
-                    # When evidence items aren't passed, check reference existence as basic fallback
-                    has_external_evidence = True
+                else:
+                    # Reference IDs alone do not prove that evidence was resolved or validated.
+                    has_external_evidence = False
 
                 if not has_external_evidence:
                     user_statements_only = (

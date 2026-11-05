@@ -30,6 +30,7 @@ class ExecutionRecord:
         self.status: str = "IN_PROGRESS"
         self.agent_records: List[Dict[str, Any]] = []
         self.errors: List[Dict[str, Any]] = []
+        self.message_records: List[Dict[str, Any]] = []
         self.token_usage: Dict[str, Any] = {}
         self.metadata: Dict[str, Any] = {}
 
@@ -64,6 +65,10 @@ class ExecutionRecord:
             "timestamp": datetime.now(timezone.utc).isoformat(),
         })
 
+    def log_message(self, message: Dict[str, Any]) -> None:
+        """Record an inter-agent message in the execution audit trail."""
+        self.message_records.append(dict(message))
+
     def finish(self, status: str = "COMPLETED", token_usage: Optional[Dict[str, Any]] = None) -> None:
         """Mark execution as finished and compute duration."""
         self.status = status
@@ -86,6 +91,7 @@ class ExecutionRecord:
             "status": self.status,
             "agent_records": self.agent_records,
             "errors": self.errors,
+            "message_records": self.message_records,
             "token_usage": self.token_usage,
             "metadata": self.metadata,
         }

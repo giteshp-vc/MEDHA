@@ -101,6 +101,10 @@ class Claim(BaseSchema):
     claim_kind: ClaimKind = ClaimKind.FACTUAL_ASSERTION
     source_provenance: List[Dict[str, str]] = Field(default_factory=list)
     evidence_references: List[str] = Field(default_factory=list, description="IDs of evidence supporting this claim")
+    unverified_evidence_references: List[str] = Field(
+        default_factory=list,
+        description="References mentioned by agents that are not registered or validated evidence.",
+    )
     supporting_reasoning: str = Field(default="", description="Logical rationale provided by the agent")
     assumptions: List[str] = Field(default_factory=list, description="Assumptions this claim relies on")
     status: ClaimStatus = Field(default=ClaimStatus.PENDING)

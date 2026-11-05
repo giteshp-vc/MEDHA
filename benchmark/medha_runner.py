@@ -1,5 +1,6 @@
 from typing import Any, Dict, Optional
 
+from config import settings
 from core.llm_client import BaseLLMClient
 from core.orchestrator import MedhaOrchestrator, MedhaResult
 from utils.logger import get_logger
@@ -21,6 +22,20 @@ class MedhaBenchmarkRunner:
             max_concurrency=max_concurrency,
             max_repair_iterations=max_repair_iterations,
         )
+
+    def benchmark_configuration(self) -> Dict[str, Any]:
+        tracker = self.orchestrator.tracker
+        client = self.orchestrator.client
+        return {
+            "provider": client.__class__.__name__.replace("Client", "").lower(),
+            "model": client.default_model or "unknown",
+            "model_version": getattr(settings, "MODEL_VERSION", "unknown"),
+            "temperature": 0.2,
+            "input_token_limit": tracker.max_input_tokens_per_call,
+            "output_token_limit": tracker.max_output_tokens_per_call,
+            "task_token_budget": tracker.max_tokens_per_task,
+            "call_budget": settings.MAX_LLM_CALLS_PER_TASK,
+        }
 
     async def run(self, task: str) -> MedhaResult:
         """Run task through complete MEDHA pipeline."""

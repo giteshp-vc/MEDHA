@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional
 
 from agents.base_agent import BaseAgent
 from models.agent_models import AgentConfig, AgentResponse
+from models.deliberation_models import DeliberationReport
 from models.schemas import AgentStatus, ClaimKind
 from models.verification_models import Claim, RepairAttempt, VerificationReport
 from utils.logger import get_logger
@@ -38,6 +39,7 @@ class SynthesizerAgent(BaseAgent):
         verification_report: VerificationReport,
         unresolved_questions: List[str],
         partial_execution_notice: Optional[str] = None,
+        deliberation_report: Optional[DeliberationReport] = None,
     ) -> str:
         """Produce the final transparent synthesized answer."""
         self.update_status(AgentStatus.EXECUTING)
@@ -53,30 +55,29 @@ class SynthesizerAgent(BaseAgent):
 
         # Format accepted claims
         accepted_text = "\n".join(
-            f"- [Claim {c.claim_id}] ({c.originating_role}): {c.claim_text}"
-            for c in verification_report.accepted_claims
+            self._format_claim(c) for c in verification_report.accepted_claims
         ) or "None explicitly accepted."
 
         # Format rejected / excluded claims
         rejected_text = "\n".join(
-            f"- [REJECTED Claim {c.claim_id}] ({c.originating_role}): {c.claim_text} | Reason: {c.reviewer_feedback or 'Unsupported'}"
+            f"- [REJECTED] {self._format_claim(c)} | Reason: {c.reviewer_feedback or 'Unsupported'}"
             for c in verification_report.rejected_claims
         ) or "None rejected."
 
         # Format needs revision / unverifiable claims
         needs_rev_text = "\n".join(
-            f"- [NEEDS REVISION Claim {c.claim_id}] ({c.originating_role}): {c.claim_text}"
+            f"- [NEEDS REVISION] {self._format_claim(c)}"
             for c in verification_report.needs_revision_claims
         ) or "None pending revision."
 
         unverifiable_text = "\n".join(
-            f"- [UNVERIFIABLE Claim {c.claim_id}] ({c.originating_role}): {c.claim_text} | Note: {c.reviewer_feedback or 'Unverifiable'}"
+            f"- [UNVERIFIABLE] {self._format_claim(c)} | Note: {c.reviewer_feedback or 'Unverifiable'}"
             for c in verification_report.unverifiable_claims
         ) or "None unverifiable."
 
         # Format unreviewed claims (interrupted before review)
         unreviewed_text = "\n".join(
-            f"- [UNREVIEWED Claim {c.claim_id}] ({c.originating_role}): {c.claim_text} | Note: {c.reviewer_feedback or 'Not audited due to audit interruption'}"
+            f"- [UNREVIEWED] {self._format_claim(c)} | Note: {c.reviewer_feedback or 'Not audited due to audit interruption'}"
             for c in verification_report.unreviewed_claims
         ) or "None unreviewed."
 
@@ -101,6 +102,7 @@ class SynthesizerAgent(BaseAgent):
         questions_text = "\n".join(f"- {q}" for q in unresolved_questions) or "None recorded."
 
         partial_notice_str = f"\n\n### NOTICE:\n{partial_execution_notice}\n" if partial_execution_notice else ""
+        deliberation_text = self._format_deliberation_report(deliberation_report, verification_report)
 
         system_instruction = (
             "You are the Lead Synthesizer for MEDHA (Multi-Agent Evidence-Driven Architecture).\n"
@@ -118,7 +120,9 @@ class SynthesizerAgent(BaseAgent):
             "6. Strict Evidence Provenance: Distinguish actual external evidence from assumptions and proposed design targets. "
             "Model agreement or reviewer acceptance alone confirms logical soundness, not empirical reality. "
             "Never present assumptions or proposed metrics as verified experimental measurements.\n"
-            "7. Structure: Use clean Markdown headers (Executive Summary, Architecture/Solution Design, "
+            "7. Deliberation context is not evidence. Use the independent VerificationReport status for each claim; "
+            "present unresolved disagreements separately and never promote consensus.\n"
+            "8. Structure: Use clean Markdown headers (Executive Summary, Architecture/Solution Design, "
             "Evidence & Verification Audit, Operating Assumptions, Unresolved Edge Cases)."
         )
 
@@ -134,18 +138,24 @@ class SynthesizerAgent(BaseAgent):
             f"- Unverifiable Claims ({len(verification_report.unverifiable_claims)}):\n{unverifiable_text}\n\n"
             f"- Unreviewed Claims ({len(verification_report.unreviewed_claims)}):\n{unreviewed_text}\n\n"
             f"- Repaired Claims ({len(verification_report.repair_history)}):\n{repairs_text}\n\n"
+            f"DELIBERATION TRANSCRIPT (UNVERIFIED CONTEXT, NOT EVIDENCE):\n{deliberation_text}\n\n"
             f"SPECIALIST CONTRIBUTIONS:\n{specialist_text}\n\n"
             f"UNRESOLVED QUESTIONS & RISKS:\n{questions_text}\n\n"
             f"Please synthesize the final, comprehensive, and evidence-traceable response for the user."
         )
 
         try:
-            final_answer = await self.client.generate_text(
-                prompt=prompt,
-                system_instruction=system_instruction,
-                model=self.model_name,
-                temperature=self.temperature,
-            )
+            with self.client.get_token_tracker().call_context(
+                agent_id=self.agent_id,
+                agent_role=self.role,
+                stage="synthesis",
+            ):
+                final_answer = await self.client.generate_text(
+                    prompt=prompt,
+                    system_instruction=system_instruction,
+                    model=self.model_name,
+                    temperature=self.temperature,
+                )
         except Exception as e:
             logger.error(f"Synthesizer failed to generate final text: {e}")
             final_answer = self._build_deterministic_fallback(
@@ -154,6 +164,7 @@ class SynthesizerAgent(BaseAgent):
                 unresolved_questions=unresolved_questions,
                 partial_execution_notice=partial_execution_notice,
                 synthesis_error=e,
+                deliberation_report=deliberation_report,
             )
 
         duration = round(time.perf_counter() - start_time, 3)
@@ -170,6 +181,7 @@ class SynthesizerAgent(BaseAgent):
         unresolved_questions: List[str],
         partial_execution_notice: Optional[str],
         synthesis_error: Exception,
+        deliberation_report: Optional[DeliberationReport] = None,
     ) -> str:
         def claim_list(claims: List[Claim]) -> str:
             formatted = []
@@ -245,6 +257,10 @@ class SynthesizerAgent(BaseAgent):
         )
         notice = partial_execution_notice or "No separate interruption notice was recorded."
         questions = "\n".join(f"- {question}" for question in unresolved_questions) or "- None recorded."
+        deliberation_text = SynthesizerAgent._format_deliberation_report(
+            deliberation_report,
+            verification_report,
+        )
 
         return (
             "# Deterministic Synthesis Report\n\n"
@@ -272,9 +288,80 @@ class SynthesizerAgent(BaseAgent):
             + f"- Unverifiable: {claim_list(verification_report.unverifiable_claims)}\n"
             + f"- Unreviewed: {claim_list(verification_report.unreviewed_claims)}\n"
             + f"- Needs revision: {claim_list(verification_report.needs_revision_claims)}\n\n"
+            "### Deliberation Transcript (Unverified Context; Not Evidence)\n"
+            + deliberation_text
+            + "\n\n"
             "### Unresolved Questions\n"
             + questions
         )
+
+    @staticmethod
+    def _format_claim(claim: Claim) -> str:
+        provenance = claim.source_provenance or [{
+            "agent_id": claim.originating_agent,
+            "role": claim.originating_role,
+            "subtask_id": claim.subtask_id,
+        }]
+        sources = "; ".join(
+            f"{item.get('role', '')} ({item.get('agent_id', '')}, {item.get('subtask_id', '')})"
+            for item in provenance
+        )
+        unverified_refs = ", ".join(claim.unverified_evidence_references) or "none"
+        return (
+            f"[Claim {claim.claim_id}] ({claim.originating_role}; sources: {sources}) "
+            f"{claim.claim_text} | unverified agent references: {unverified_refs}"
+        )
+
+    @staticmethod
+    def _format_deliberation_report(
+        deliberation_report: Optional[DeliberationReport],
+        verification_report: VerificationReport,
+    ) -> str:
+        if deliberation_report is None:
+            return "No deliberation report was produced."
+
+        claim_statuses = {
+            claim.claim_id: claim.status
+            for claim in (
+                verification_report.accepted_claims
+                + verification_report.rejected_claims
+                + verification_report.needs_revision_claims
+                + verification_report.unverifiable_claims
+                + verification_report.unreviewed_claims
+            )
+        }
+        lines = [f"Termination reason: {deliberation_report.termination_reason}"]
+        for exchange in deliberation_report.exchanges:
+            lines.append(
+                f"- Exchange {exchange.exchange_id}; response message {exchange.response_message_id}; "
+                f"trigger={exchange.trigger_type}; claim_reference={exchange.claim_reference or 'none'}"
+            )
+            if exchange.response_content:
+                lines.append(f"  Response (unverified): {exchange.response_content}")
+            for index, text in enumerate(exchange.introduced_claims):
+                claim_id = exchange.introduced_claim_ids[index] if index < len(exchange.introduced_claim_ids) else None
+                status = claim_statuses.get(claim_id) if claim_id else None
+                label = str(status) if status is not None else "UNREGISTERED / UNREVIEWED"
+                lines.append(f"  Deliberation-introduced claim [{claim_id or 'no ledger ID'}; {label}]: {text}")
+            lines.extend(f"  Clarification (unverified): {text}" for text in exchange.clarifications)
+            if exchange.evidence_references:
+                lines.append(
+                    "  Agent-supplied evidence references (UNVERIFIED, not ledger evidence): "
+                    + ", ".join(exchange.evidence_references)
+                )
+            lines.extend(f"  Unresolved question: {item}" for item in exchange.unresolved_questions)
+            if exchange.disagreement:
+                lines.append("  Unresolved disagreement: specialist disagreement is not a factual conclusion.")
+            if exchange.diagnostic:
+                lines.append(f"  Diagnostic: {exchange.diagnostic}")
+        lines.extend(
+            f"- Suppressed {item.trigger_type} trigger for {item.claim_reference or 'unreferenced claim'}: {item.reason}"
+            for item in deliberation_report.suppressed_triggers
+        )
+        lines.extend(f"- Unresolved disagreement: {item}" for item in deliberation_report.unresolved_disagreements)
+        lines.extend(f"- Unresolved deliberation question: {item}" for item in deliberation_report.unresolved_questions)
+        lines.extend(f"- Deliberation diagnostic: {item}" for item in deliberation_report.diagnostics)
+        return "\n".join(lines)
 
     async def execute(self, context: Optional[Dict[str, Any]] = None) -> AgentResponse:
         """Generic execution implementation to satisfy BaseAgent contract."""

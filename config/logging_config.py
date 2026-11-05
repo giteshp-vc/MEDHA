@@ -49,7 +49,8 @@ def setup_logging(
     )
 
     # Console Handler
-    console_handler = logging.StreamHandler(sys.stdout)
+    # MCP stdio transport reserves stdout for JSON-RPC frames.
+    console_handler = logging.StreamHandler(sys.stderr)
     console_handler.setLevel(numeric_level)
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)

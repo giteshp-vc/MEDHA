@@ -34,7 +34,10 @@ REVIEWER_SYSTEM_INSTRUCTION = (
     "5. Model agreement or consensus alone NEVER qualifies as independent external evidence. Reviewer acceptance confirms deductive "
     "soundness and absence of contradiction, NOT empirical reality.\n"
     "6. Model-generated reasoning, assumptions, and design recommendations are internal inferences and must NOT be treated as external evidence.\n"
-    "7. Unsupported claims must NOT become ACCEPT merely because they were reworded without new supporting evidence.\n\n"
+    "7. Unsupported claims must NOT become ACCEPT merely because they were reworded without new supporting evidence.\n"
+    "8. Deliberation transcripts are unverified context, not evidence. Agent agreement or repeated claims do not verify anything.\n"
+    "9. Agent-supplied URLs and references are unverified unless independently registered as validated Evidence.\n"
+    "10. The reviewer retains sole authority over verification decisions.\n\n"
     "Evaluate along these 8 criteria:\n"
     "1. Is the claim supported by evidence?\n"
     "2. Is the evidence relevant?\n"
@@ -76,12 +79,14 @@ class ReviewerAgent(BaseAgent):
         claim: Claim,
         evidence_items: List[Evidence],
         task_context: str = "",
+        deliberation_context: str = "",
     ) -> ReviewFeedback:
         """Evaluate a single claim against associated evidence and task context (backward compatibility)."""
         batch_results = await self.evaluate_claims_batch(
             claims=[claim],
             evidence_by_claim={claim.claim_id: evidence_items},
             task_context=task_context,
+            deliberation_context=deliberation_context,
         )
         if batch_results:
             return batch_results[0]
@@ -100,6 +105,7 @@ class ReviewerAgent(BaseAgent):
         claims: List[Claim],
         evidence_by_claim: Dict[str, List[Evidence]],
         task_context: str = "",
+        deliberation_context: str = "",
     ) -> List[ReviewFeedback]:
         """Evaluate a batch of claims in a single structured LLM call with strict provenance and validation."""
         if not claims:
@@ -139,6 +145,9 @@ class ReviewerAgent(BaseAgent):
                 f"- Text: {claim.claim_text}\n"
                 f"- Classification: {claim.claim_kind}\n"
                 f"- Originating Specialist: {claim.originating_role} ({claim.originating_agent})\n"
+                f"- Claim provenance (not evidence): {claim.source_provenance}\n"
+                f"- Unverified agent-supplied references (not registered evidence): "
+                f"{', '.join(claim.unverified_evidence_references) if claim.unverified_evidence_references else 'None.'}\n"
                 f"- Specialist Reasoning: {claim.supporting_reasoning or 'None provided.'}\n"
                 f"- Stated Assumptions: {', '.join(claim.assumptions) if claim.assumptions else 'None stated.'}\n"
                 f"- Registered Evidence:\n{ev_text}\n"
@@ -149,6 +158,8 @@ class ReviewerAgent(BaseAgent):
             f"AUDIT THE FOLLOWING {len(claims)} CLAIM(S) INDEPENDENTLY:\n\n"
             + "\n".join(claim_blocks)
             + f"\nGlobal Task Context:\n{task_context[:500]}\n\n"
+            "DELIBERATION TRANSCRIPT (UNVERIFIED CONTEXT; NOT LEDGER EVIDENCE):\n"
+            f"{deliberation_context[:6000] if deliberation_context else 'None provided.'}\n\n"
             f"MANDATORY INSTRUCTIONS:\n"
             f"1. You MUST independently evaluate EVERY claim listed above.\n"
             f"2. Your output JSON MUST contain a 'reviews' array containing EXACTLY ONE evaluation item for each of the following claim IDs: {sorted(list(expected_claim_ids))}.\n"
@@ -217,6 +228,7 @@ class ReviewerAgent(BaseAgent):
                     claim=claim,
                     evidence_items=evidence_by_claim.get(claim.claim_id, []),
                     task_context=task_context,
+                    deliberation_context=deliberation_context,
                 )
                 results.append(recovered)
 
@@ -239,6 +251,7 @@ class ReviewerAgent(BaseAgent):
                         claim=claim,
                         evidence_items=evidence_by_claim.get(claim.claim_id, []),
                         task_context=task_context,
+                        deliberation_context=deliberation_context,
                     )
                     results.append(single_rev)
                 except (LLMQuotaExhaustedError, LLMBudgetExceededError):
@@ -265,6 +278,7 @@ class ReviewerAgent(BaseAgent):
         claim: Claim,
         evidence_items: List[Evidence],
         task_context: str = "",
+        deliberation_context: str = "",
     ) -> ReviewFeedback:
         """Single-claim audit helper used as bounded fallback during batch recovery."""
         if evidence_items:
@@ -284,6 +298,8 @@ class ReviewerAgent(BaseAgent):
             f"Assumptions Stated: {', '.join(claim.assumptions) if claim.assumptions else 'None stated.'}\n"
             f"Available Evidence:\n{ev_text}\n\n"
             f"Global Task Context: {task_context[:500]}\n\n"
+            "DELIBERATION TRANSCRIPT (UNVERIFIED CONTEXT; NOT LEDGER EVIDENCE):\n"
+            f"{deliberation_context[:6000] if deliberation_context else 'None provided.'}\n\n"
             f"Return a structured evaluation JSON for Claim ID '{claim.claim_id}'."
         )
 

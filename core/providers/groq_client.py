@@ -122,18 +122,35 @@ class GroqClient(BaseLLMClient):
         ]
         return any(kw in msg for kw in format_keywords)
 
-    async def _track_usage_from_response(self, response: Any) -> None:
+    async def _track_usage_from_response(self, response: Any, call_recorder: Any = None) -> None:
         """Extract and record token usage metadata from Groq response."""
         usage = getattr(response, "usage", None)
-        prompt_tokens = getattr(usage, "prompt_tokens", 0) or 0 if usage else 0
-        candidate_tokens = getattr(usage, "completion_tokens", 0) or 0 if usage else 0
-        total_tokens = getattr(usage, "total_tokens", 0) or 0 if usage else 0
+        prompt_value = getattr(usage, "prompt_tokens", None) if usage else None
+        candidate_value = getattr(usage, "completion_tokens", None) if usage else None
+        total_value = getattr(usage, "total_tokens", None) if usage else None
+        prompt_tokens = prompt_value if isinstance(prompt_value, int) and not isinstance(prompt_value, bool) else None
+        candidate_tokens = candidate_value if isinstance(candidate_value, int) and not isinstance(candidate_value, bool) else None
+        total_tokens = total_value if isinstance(total_value, int) and not isinstance(total_value, bool) else None
+
+        self.record_provider_usage(call_recorder, prompt_tokens, candidate_tokens, total_tokens)
+        if call_recorder is not None and candidate_tokens is None:
+            try:
+                content = response.choices[0].message.content if response.choices else None
+                if isinstance(content, str):
+                    call_recorder.set_estimated_candidate_tokens(
+                        self.token_tracker.estimate_tokens(content)
+                    )
+            except Exception:
+                pass
 
         await self.token_tracker.add_usage(
-            prompt_tokens=prompt_tokens,
-            candidate_tokens=candidate_tokens,
-            total_tokens=total_tokens,
-            usage_available=bool(usage and (prompt_tokens or candidate_tokens or total_tokens)),
+            prompt_tokens=prompt_tokens or 0,
+            candidate_tokens=candidate_tokens or 0,
+            total_tokens=total_tokens or 0,
+            usage_available=any(
+                isinstance(value, int) and not isinstance(value, bool) and value > 0
+                for value in (prompt_tokens, candidate_tokens, total_tokens)
+            ),
         )
 
     async def generate_text(
@@ -161,8 +178,20 @@ class GroqClient(BaseLLMClient):
         estimated_input_tokens = self.token_tracker.estimate_tokens(
             "\n".join(message["content"] for message in messages)
         )
+        retry_attempt = 0
+        wire_attempt = 0
+        attempt_recorders: Dict[int, List[Any]] = {}
+
+        def on_attempt_failure(attempt_number: int, error: Exception) -> None:
+            self.mark_timed_out_provider_calls(
+                attempt_recorders.get(attempt_number, []),
+                error,
+            )
 
         async def _call() -> str:
+            nonlocal retry_attempt, wire_attempt
+            retry_attempt += 1
+            wire_attempt += 1
             kwargs: Dict[str, Any] = {
                 "model": target_model,
                 "messages": messages,
@@ -172,13 +201,17 @@ class GroqClient(BaseLLMClient):
             if timeout_seconds is not None:
                 kwargs["timeout"] = timeout_seconds
 
-            async with self.token_tracker.track_call(
-                MAX_LLM_CALLS_PER_TASK,
-                estimated_input_tokens=estimated_input_tokens,
-                max_output_tokens=output_limit,
-            ):
-                response = await client.chat.completions.create(**kwargs)
-                await self._track_usage_from_response(response)
+            response, _ = await self.execute_provider_request(
+                lambda: client.chat.completions.create(**kwargs),
+                attempt_number=wire_attempt,
+                model=target_model,
+                temperature=temp,
+                output_token_limit=output_limit,
+                timeout_seconds=timeout_seconds,
+                estimated_prompt_tokens=estimated_input_tokens,
+                usage_callback=self._track_usage_from_response,
+                attempt_recorders=attempt_recorders.setdefault(retry_attempt, []),
+            )
 
             content = ""
             if hasattr(response, "choices") and response.choices:
@@ -189,18 +222,14 @@ class GroqClient(BaseLLMClient):
                 raise LLMClientError("Empty response returned by Groq model", status_code=500)
             return content
 
-        try:
-            return await execute_with_retry(
-                _call,
-                max_retries=max_retries,
-                initial_delay=INITIAL_RETRY_DELAY,
-                max_delay=MAX_RETRY_DELAY,
-                timeout_seconds=timeout_seconds,
-            )
-        except Exception as error:
-            if not isinstance(error, LLMBudgetExceededError):
-                await self.token_tracker.record_failure()
-            raise
+        return await execute_with_retry(
+            _call,
+            max_retries=max_retries,
+            initial_delay=INITIAL_RETRY_DELAY,
+            max_delay=MAX_RETRY_DELAY,
+            timeout_seconds=timeout_seconds,
+            on_attempt_failure=on_attempt_failure,
+        )
 
     async def generate_structured(
         self,
@@ -236,8 +265,19 @@ class GroqClient(BaseLLMClient):
         estimated_input_tokens = self.token_tracker.estimate_tokens(
             "\n".join(message["content"] for message in messages)
         )
+        retry_attempt = 0
+        wire_attempt = 0
+        attempt_recorders: Dict[int, List[Any]] = {}
+
+        def on_attempt_failure(attempt_number: int, error: Exception) -> None:
+            self.mark_timed_out_provider_calls(
+                attempt_recorders.get(attempt_number, []),
+                error,
+            )
 
         async def _call() -> T:
+            nonlocal retry_attempt, wire_attempt
+            retry_attempt += 1
             kwargs: Dict[str, Any] = {
                 "model": target_model,
                 "messages": messages,
@@ -247,34 +287,48 @@ class GroqClient(BaseLLMClient):
             if timeout_seconds is not None:
                 kwargs["timeout"] = timeout_seconds
 
-            async with self.token_tracker.track_call(
-                MAX_LLM_CALLS_PER_TASK,
-                estimated_input_tokens=estimated_input_tokens,
-                max_output_tokens=output_limit,
-            ):
-                # Try JSON mode first where supported
-                try:
-                    response = await client.chat.completions.create(
-                        **kwargs,
-                        response_format={"type": "json_object"},
-                    )
-                except Exception as format_err:
-                    # STRICT REQUIREMENT: Only fall back if the model explicitly reports unsupported response_format.
-                    # Quota errors (429), auth errors (401), server errors (500), timeouts, etc. must NOT fall back.
-                    if self._is_unsupported_format_error(format_err):
-                        logger.warning(
-                            f"Groq json_object format explicitly unsupported ({format_err}); "
-                            f"falling back to standard completion with schema prompt..."
-                        )
-                        response = await client.chat.completions.create(**kwargs)
-                    else:
-                        logger.error(
-                            f"Groq request failed with non-format error ({format_err.__class__.__name__}: {format_err}). "
-                            f"Not falling back to plain text."
-                        )
-                        raise
+            async def request_once(use_json_mode: bool):
+                nonlocal wire_attempt
+                wire_attempt += 1
 
-                await self._track_usage_from_response(response)
+                async def send_request():
+                    if use_json_mode:
+                        return await client.chat.completions.create(
+                            **kwargs,
+                            response_format={"type": "json_object"},
+                        )
+                    return await client.chat.completions.create(**kwargs)
+
+                return await self.execute_provider_request(
+                    send_request,
+                    attempt_number=wire_attempt,
+                    retry_number=retry_attempt - 1,
+                    is_fallback=not use_json_mode,
+                    model=target_model,
+                    temperature=temp,
+                    output_token_limit=output_limit,
+                    timeout_seconds=timeout_seconds,
+                    estimated_prompt_tokens=estimated_input_tokens,
+                    usage_callback=self._track_usage_from_response,
+                    attempt_recorders=attempt_recorders.setdefault(retry_attempt, []),
+                )
+
+            # Try JSON mode first where supported. The fallback is a distinct provider request.
+            try:
+                response, _ = await request_once(use_json_mode=True)
+            except Exception as format_err:
+                if self._is_unsupported_format_error(format_err):
+                    logger.warning(
+                        "Groq JSON response format is unsupported (%s); retrying without response_format.",
+                        type(format_err).__name__,
+                    )
+                    response, _ = await request_once(use_json_mode=False)
+                else:
+                    logger.error(
+                        "Groq structured request failed (%s); not retrying as plain text.",
+                        type(format_err).__name__,
+                    )
+                    raise
 
             raw_text = ""
             if hasattr(response, "choices") and response.choices:
@@ -299,15 +353,11 @@ class GroqClient(BaseLLMClient):
                             response_schema.__name__, raw_text, final_err
                         ) from final_err
 
-        try:
-            return await execute_with_retry(
-                _call,
-                max_retries=max_retries,
-                initial_delay=INITIAL_RETRY_DELAY,
-                max_delay=MAX_RETRY_DELAY,
-                timeout_seconds=timeout_seconds,
-            )
-        except Exception as error:
-            if not isinstance(error, LLMBudgetExceededError):
-                await self.token_tracker.record_failure()
-            raise
+        return await execute_with_retry(
+            _call,
+            max_retries=max_retries,
+            initial_delay=INITIAL_RETRY_DELAY,
+            max_delay=MAX_RETRY_DELAY,
+            timeout_seconds=timeout_seconds,
+            on_attempt_failure=on_attempt_failure,
+        )

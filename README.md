@@ -223,18 +223,24 @@ Run a task using the un-orchestrated single-agent baseline for direct comparison
 python main.py --baseline "Design a high-throughput financial ledger processing 100k TPS."
 ```
 
-### 4. Quantitative Benchmark Suite
-Run the comparative benchmark suite evaluating MEDHA against the single-agent baseline:
+### 4. Four-Arm Benchmark Suite
+Run the four-arm frozen-plan experiment comparing the single-agent baseline, independent specialists, dependency-aware execution, and full MEDHA:
 ```powershell
-python main.py --benchmark
+python main.py --benchmark --benchmark-cases 5 --benchmark-repetitions 2 --experiment-id phase52c-smoke
 ```
-Output reports will be exported to:
-- `benchmark/benchmark_report.json`
-- `benchmark/benchmark_results.csv`
+Each explicit experiment ID produces `benchmark/experiments/<experiment-id>.json` and `.csv`. Existing files are never overwritten. `--benchmark-output` selects a directory within `benchmark/`, for example `--benchmark-output experiments/run-01`.
 
 #### Benchmark Status and Protocol
 
-The current benchmark is exploratory; its results do not establish that MEDHA is superior to a single agent. Before drawing that conclusion, a controlled comparison must use identical prompts and evaluation criteria, the same provider/model version and temperature, and a documented, comparable per-task token budget. The current runner does not enforce matching injected runner configurations or equal total-token budgets. Its lexical reference-criteria and pitfall matching is not a blinded quality assessment, and claim-support statistics are produced for MEDHA but not independently for the baseline. Cost estimates also need provider- and model-specific pricing rather than a fixed Gemini rate.
+The evaluator prepares one frozen plan per task block and reuses it for arms B, C, and D; arm A calls the baseline directly. Each run gets a fresh plan copy and independent accounting. Planner preparation cost is recorded once as actual experiment expenditure and included as shared preparation cost in each B/C/D end-to-end comparison figure. The deterministic four-sequence schedule rotates through A-B-D-C, B-C-A-D, C-D-B-A, and D-A-C-B. Planned and actual orders are both exported, along with whether a complete, uninterrupted four-sequence cycle occurred.
+
+Results are exploratory and do not claim statistical significance. Configuration mismatches or unknown required settings remain visible in trial records and exclude incompatible trials from comparative aggregates. Automated completeness, pitfall, uncertainty, and evidence-quality metrics are proxies, not factual correctness. No human factual score is fabricated; factual correctness remains null without an actual blinded human or independent expert score.
+
+Only a nonempty successful output is eligible for answer-quality aggregates. Failed, partial, empty, and interrupted attempts remain in the JSON/CSV outputs with diagnostics and any available answer. Verification metrics for arm A are null/N/A because verification is not executed. Missing values retain eligible counts, attempt counts, and missingness reasons in JSON.
+
+Token counts come from the `AccountingSnapshot`; provider-call records are used for request, retry, failure, duration, and dropped-record telemetry, avoiding double counting. Costs require explicit provider/model input and output pricing. Missing pricing or usage remains unknown, and estimated/mixed usage keeps its provenance label.
+
+Tests use mocked providers and deterministic fixtures. Do not treat successful mocked tests as evidence of live provider behavior. The benchmark command is an explicit live experiment and should only be run intentionally with valid provider configuration.
 
 For live validation, first confirm provider quota in its console, then run a small two- or three-specialist task. Compare discovered, deduplicated/registered, capacity-rejected, reviewed, and unreviewed claims. Include deliberately unsupported empirical claims and confirm they are not accepted without external evidence. Run the larger attendance-system task only after the smaller run completes successfully. Do not treat a successful mocked test as evidence of live provider behavior.
 

@@ -1,11 +1,14 @@
 import csv
 import json
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from benchmark.baseline import SingleAgentBaseline
 from benchmark.medha_runner import MedhaBenchmarkRunner
 from benchmark.metrics import (
+    BenchmarkConfiguration,
     SystemMetrics,
     TaskEvaluationResult,
     compute_system_metrics,
@@ -14,6 +17,17 @@ from config.settings import BENCHMARK_DIR
 from utils.logger import get_logger
 
 logger = get_logger("benchmark_evaluator")
+
+
+class BenchmarkConfigurationMismatchError(ValueError):
+    """Raised when baseline and MEDHA are not configured for a comparable run."""
+
+    def __init__(self, differences: Dict[str, Any]):
+        self.differences = differences
+        super().__init__(
+            "Benchmark configurations are incompatible; refusing comparison: "
+            + json.dumps(differences, sort_keys=True)
+        )
 
 
 def _format_pct(val: Any) -> str:
@@ -36,10 +50,122 @@ class BenchmarkEvaluator:
         dataset_path: Optional[Path] = None,
         baseline_runner: Optional[SingleAgentBaseline] = None,
         medha_runner: Optional[MedhaBenchmarkRunner] = None,
+        pricing: Optional[Dict[str, Dict[str, float]]] = None,
     ):
         self.dataset_path = dataset_path or (BENCHMARK_DIR / "benchmark_dataset.json")
         self.baseline_runner = baseline_runner or SingleAgentBaseline()
         self.medha_runner = medha_runner or MedhaBenchmarkRunner()
+        self.pricing = pricing or {}
+
+    async def run_experiment(
+        self,
+        max_cases: Optional[int] = None,
+        repetitions: int = 1,
+        experiment_id: Optional[str] = None,
+        output_directory: Optional[Path] = None,
+    ):
+        """Run the reproducible four-arm frozen-plan benchmark experiment."""
+        from benchmark.four_arm import FourArmBenchmark
+
+        return await FourArmBenchmark(self).run(
+            max_cases=max_cases,
+            repetitions=repetitions,
+            experiment_id=experiment_id,
+            output_directory=output_directory,
+        )
+
+    @staticmethod
+    def _runner_configuration(runner: Any) -> BenchmarkConfiguration:
+        raw = {}
+        method = getattr(runner, "benchmark_configuration", None)
+        if callable(method):
+            candidate = method()
+            if isinstance(candidate, dict):
+                raw = candidate
+        return BenchmarkConfiguration.model_validate(raw or {})
+
+    def _check_configurations(self) -> Dict[str, Any]:
+        baseline = self._runner_configuration(self.baseline_runner)
+        medha = self._runner_configuration(self.medha_runner)
+        differences = baseline.compatibility_differences(medha)
+        if differences:
+            raise BenchmarkConfigurationMismatchError(differences)
+        return {"BASELINE": baseline.model_dump(), "MEDHA": medha.model_dump(), "differences": differences}
+
+    def _cost_for(self, configuration: Dict[str, Any], token_usage: Dict[str, Any]) -> Dict[str, Any]:
+        provider = configuration.get("provider", "unknown")
+        model = configuration.get("model", "unknown")
+        price = self.pricing.get(f"{provider}:{model}") or self.pricing.get(provider)
+        usage_source = token_usage.get("usage_source", "unknown")
+        if price is None:
+            return {
+                "amount_usd": None,
+                "status": "unknown",
+                "reason": "No provider/model pricing was configured.",
+                "usage_source": usage_source,
+            }
+        token_key = "total_tokens" if usage_source == "provider" else "accounted_total_tokens"
+        tokens = token_usage.get(token_key)
+        if tokens is None:
+            return {
+                "amount_usd": None,
+                "status": "unknown",
+                "reason": "Token usage was unavailable.",
+                "usage_source": usage_source,
+            }
+        input_tokens = token_usage.get("prompt_tokens", 0)
+        output_tokens = token_usage.get("candidate_tokens", 0)
+        amount = (
+            input_tokens * price.get("input_per_million_usd", 0.0)
+            + output_tokens * price.get("output_per_million_usd", 0.0)
+        ) / 1_000_000.0
+        return {
+            "amount_usd": round(amount, 8),
+            "status": (
+                "actual" if usage_source == "provider"
+                else "mixed" if usage_source == "mixed"
+                else "estimated"
+            ),
+            "reason": "Provider-reported usage." if usage_source == "provider" else "Conservative local estimate.",
+            "usage_source": usage_source,
+        }
+
+    @staticmethod
+    def _answer_metrics(
+        matched: List[str],
+        total_criteria: int,
+        pitfalls: List[str],
+        total_pitfalls: int,
+        answer: str,
+        success: bool,
+        verification_stats: Dict[str, Any],
+        human_scores: Optional[Dict[str, float]] = None,
+    ) -> tuple[Dict[str, Optional[float]], List[str]]:
+        lower = answer.lower()
+        reasoning = ["completeness uses the shared reference-criteria evaluator"]
+        scores: Dict[str, Optional[float]] = {
+            "answer_completeness": round(len(matched) / total_criteria, 3) if total_criteria else None,
+            "task_completion": 1.0 if success else 0.0,
+            "pitfall_avoidance": round(1 - len(pitfalls) / total_pitfalls, 3) if total_pitfalls else None,
+            "uncertainty_handling": 1.0 if any(
+                marker in lower for marker in ("assumption", "uncertain", "depends", "unknown", "limitation")
+            ) else 0.0,
+            "evidence_quality": 1.0 if any(
+                marker in lower for marker in ("evidence", "source", "citation", "benchmark", "reference")
+            ) else 0.0,
+            "factual_correctness": None,
+            "unsupported_claim_rate": verification_stats.get("unsupported_claim_rate"),
+        }
+        reasoning.extend([
+            "pitfall avoidance, uncertainty handling, and evidence quality are automated proxies",
+            "factual correctness requires blinded human or independent expert scoring unless supplied",
+        ])
+        if human_scores:
+            for name, value in human_scores.items():
+                if name in scores:
+                    scores[name] = value
+            reasoning.append("human scores were supplied separately from MEDHA's internal reviewer")
+        return scores, reasoning
 
     def load_dataset(self) -> List[Dict[str, Any]]:
         """Load benchmark dataset test cases."""
@@ -61,6 +187,14 @@ class BenchmarkEvaluator:
         known_pitfalls: List[str],
         verification_stats: Optional[Dict[str, Any]] = None,
         error: Optional[str] = None,
+        experiment_id: str = "",
+        trial_id: str = "",
+        trial_index: int = 0,
+        execution_order: Optional[List[str]] = None,
+        timestamp: str = "",
+        configuration: Optional[Dict[str, Any]] = None,
+        human_scores: Optional[Dict[str, float]] = None,
+        completion_status: str = "UNKNOWN",
     ) -> TaskEvaluationResult:
         """Evaluate a generated answer against reference criteria and known pitfalls."""
         matched: List[str] = []
@@ -85,6 +219,16 @@ class BenchmarkEvaluator:
 
         total_crit = len(reference_criteria)
         score = round(len(matched) / total_crit, 3) if total_crit > 0 else 0.0
+        completion_status = str(completion_status or "UNKNOWN").upper()
+        if error is not None and completion_status == "SUCCESS":
+            completion_status = "FAILED"
+        elif completion_status == "SUCCESS" and not answer.strip():
+            completion_status = "EMPTY_OUTPUT"
+        success = completion_status == "SUCCESS"
+        answer_metrics, evaluator_reasoning = self._answer_metrics(
+            matched, total_crit, found_pitfalls, len(known_pitfalls), answer, success, verification_stats or {}, human_scores
+        )
+        configuration = configuration or {}
 
         return TaskEvaluationResult(
             task_id=task_id,
@@ -92,7 +236,9 @@ class BenchmarkEvaluator:
             mode=mode,
             prompt=prompt,
             answer=answer,
-            success=(error is None and len(answer) > 0),
+            success=success,
+            completion_status=completion_status,
+            quality_eligible=success,
             duration_seconds=duration,
             token_usage=token_usage,
             matched_criteria=matched,
@@ -101,22 +247,48 @@ class BenchmarkEvaluator:
             criteria_coverage_score=score,
             verification_stats=verification_stats or {},
             error=error,
+            experiment_id=experiment_id,
+            trial_id=trial_id,
+            trial_index=trial_index,
+            execution_order=execution_order or [],
+            timestamp=timestamp,
+            configuration=configuration,
+            answer_metrics=answer_metrics,
+            evaluator_reasoning=evaluator_reasoning,
+            cost=self._cost_for(configuration, token_usage),
+            scoring_evidence={
+                "matched_criteria": matched,
+                "missed_criteria": missed,
+                "identified_pitfalls": found_pitfalls,
+                "human_scores_supplied": bool(human_scores),
+            },
         )
 
     async def run_benchmark(
         self,
         max_cases: Optional[int] = None,
+        repetitions: int = 1,
+        experiment_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Execute the benchmark suite on both Mode A and Mode B and return comparative results."""
         cases = self.load_dataset()
         if max_cases:
             cases = cases[:max_cases]
 
-        logger.info(f"Starting benchmark evaluation across {len(cases)} test cases...")
+        if repetitions < 1:
+            raise ValueError("repetitions must be at least 1")
+        configurations = self._check_configurations()
+        experiment_id = experiment_id or f"exp_{uuid.uuid4().hex[:12]}"
+        logger.info(
+            f"Starting benchmark experiment {experiment_id} across {len(cases)} test cases "
+            f"with {repetitions} counterbalanced repetition(s)..."
+        )
 
         baseline_results: List[TaskEvaluationResult] = []
         medha_results: List[TaskEvaluationResult] = []
 
+        trial_results: List[TaskEvaluationResult] = []
+        trial_records: List[Dict[str, Any]] = []
         for idx, case in enumerate(cases, 1):
             task_id = case["id"]
             domain = case["domain"]
@@ -124,59 +296,101 @@ class BenchmarkEvaluator:
             ref_crit = case.get("reference_criteria", [])
             pitfalls = case.get("known_pitfalls", [])
 
-            logger.info(f"[{idx}/{len(cases)}] Benchmarking: {task_id} ({domain})")
-
-            # --- Run Mode A: Single-Agent Baseline ---
-            logger.info(f"Running Mode A (Baseline) for {task_id}...")
-            b_res = await self.baseline_runner.run(prompt)
-            eval_b = self.evaluate_answer(
-                task_id=task_id,
-                domain=domain,
-                mode="BASELINE",
-                prompt=prompt,
-                answer=b_res.answer,
-                duration=b_res.duration_seconds,
-                token_usage=b_res.token_usage,
-                reference_criteria=ref_crit,
-                known_pitfalls=pitfalls,
-                error=b_res.error,
-            )
-            baseline_results.append(eval_b)
-
-            # --- Run Mode B: MEDHA Multi-Agent ---
-            logger.info(f"Running Mode B (MEDHA) for {task_id}...")
-            m_res = await self.medha_runner.run(prompt)
-            v_rep = m_res.verification_report or {}
-            v_stats = {
-                "total_claims": v_rep.get("total_claims", len(m_res.claims)),
-                "accepted_claims_count": len(v_rep.get("accepted_claims", [])),
-                "rejected_claims_count": len(v_rep.get("rejected_claims", [])),
-                "support_rate": v_rep.get("support_rate"),
-                "unsupported_rate": v_rep.get("unsupported_rate"),
-                "repair_success_rate": v_rep.get("repair_success_rate", 0.0),
-            }
-            eval_m = self.evaluate_answer(
-                task_id=task_id,
-                domain=domain,
-                mode="MEDHA",
-                prompt=prompt,
-                answer=m_res.final_answer,
-                duration=m_res.duration_seconds,
-                token_usage=m_res.token_usage,
-                reference_criteria=ref_crit,
-                known_pitfalls=pitfalls,
-                verification_stats=v_stats,
-                error=m_res.error,
-            )
-            medha_results.append(eval_m)
+            for repetition in range(repetitions):
+                order = ["BASELINE", "MEDHA"] if repetition % 2 == 0 else ["MEDHA", "BASELINE"]
+                trial_id = f"{experiment_id}_{task_id}_{repetition + 1}"
+                trial_timestamp = datetime.now(timezone.utc).isoformat()
+                trial_records.append({"trial_id": trial_id, "task_id": task_id, "trial_index": repetition + 1, "execution_order": order, "timestamp": trial_timestamp})
+                for mode in order:
+                    runner = self.baseline_runner if mode == "BASELINE" else self.medha_runner
+                    try:
+                        raw = await runner.run(prompt)
+                        if mode == "BASELINE":
+                            answer = raw.answer
+                            duration = raw.duration_seconds
+                            token_usage = raw.token_usage
+                            error = raw.error
+                            verification_stats = {}
+                            completion_status = (
+                                "SUCCESS"
+                                if raw.success is True and error is None and answer.strip()
+                                else "FAILED" if raw.success is not True or error is not None
+                                else "EMPTY_OUTPUT"
+                            )
+                        else:
+                            answer = raw.final_answer
+                            duration = raw.duration_seconds
+                            token_usage = raw.token_usage
+                            error = raw.error
+                            reported_status = str(getattr(raw.status, "value", raw.status)).upper()
+                            completion_status = (
+                                reported_status
+                                if reported_status in {
+                                    "SUCCESS",
+                                    "PARTIAL_FAILURE",
+                                    "FAILED",
+                                    "CANCELLED",
+                                    "INTERRUPTED",
+                                }
+                                else "UNKNOWN"
+                            )
+                            if completion_status == "SUCCESS" and not answer.strip():
+                                completion_status = "EMPTY_OUTPUT"
+                            v_rep = raw.verification_report or {}
+                            verification_stats = {
+                                "total_claims": v_rep.get("total_claims", len(raw.claims)),
+                                "accepted_claims_count": len(v_rep.get("accepted_claims", [])),
+                                "rejected_claims_count": len(v_rep.get("rejected_claims", [])),
+                                "support_rate": v_rep.get("support_rate"),
+                                "unsupported_rate": v_rep.get("unsupported_rate"),
+                                "unsupported_claim_rate": v_rep.get("unsupported_rate"),
+                                "repair_success_rate": v_rep.get("repair_success_rate", 0.0),
+                            }
+                    except Exception as exc:
+                        answer, duration, token_usage, error, verification_stats = "", 0.0, {}, f"{type(exc).__name__}: {exc}", {}
+                        completion_status = "EXCEPTION"
+                    evaluated = self.evaluate_answer(
+                        task_id=task_id,
+                        domain=domain,
+                        mode=mode,
+                        prompt=prompt,
+                        answer=answer,
+                        duration=duration,
+                        token_usage=token_usage,
+                        reference_criteria=ref_crit,
+                        known_pitfalls=pitfalls,
+                        verification_stats=verification_stats,
+                        error=error,
+                        experiment_id=experiment_id,
+                        trial_id=trial_id,
+                        trial_index=repetition + 1,
+                        execution_order=order,
+                        timestamp=trial_timestamp,
+                        configuration=configurations[mode],
+                        human_scores=(case.get("human_scores", {}) or {}).get(mode),
+                        completion_status=completion_status,
+                    )
+                    trial_results.append(evaluated)
+                    (baseline_results if mode == "BASELINE" else medha_results).append(evaluated)
 
         # Compute aggregate metrics
         baseline_metrics = compute_system_metrics("Single-Agent Baseline (Mode A)", baseline_results)
         medha_metrics = compute_system_metrics("MEDHA Multi-Agent (Mode B)", medha_results)
 
         comparison_data = {
+            "experiment_id": experiment_id,
+            "repetitions": repetitions,
+            "configurations": configurations,
+            "trial_records": trial_records,
+            "evaluation_protocol": {
+                "same_evaluator": True,
+                "automated_metrics_are_heuristics": True,
+                "human_evaluation_supported": True,
+                "statistical_significance_claimed": False,
+            },
             "baseline_metrics": baseline_metrics.model_dump(),
             "medha_metrics": medha_metrics.model_dump(),
+            "trials": [r.model_dump() for r in trial_results],
             "baseline_tasks": [r.model_dump() for r in baseline_results],
             "medha_tasks": [r.model_dump() for r in medha_results],
         }
@@ -207,9 +421,15 @@ class BenchmarkEvaluator:
         target.parent.mkdir(parents=True, exist_ok=True)
 
         headers = [
+            "experiment_id",
+            "trial_id",
+            "trial_index",
+            "execution_order",
             "task_id",
             "domain",
             "mode",
+            "completion_status",
+            "quality_eligible",
             "success",
             "duration_seconds",
             "total_tokens",
@@ -218,6 +438,17 @@ class BenchmarkEvaluator:
             "missed_criteria_count",
             "identified_pitfalls_count",
             "claim_support_rate",
+            "answer_completeness",
+            "factual_correctness",
+            "unsupported_claim_rate",
+            "evidence_quality",
+            "uncertainty_handling",
+            "task_completion",
+            "cost_amount_usd",
+            "cost_status",
+            "cost_usage_source",
+            "answer",
+            "error",
         ]
 
         with open(target, "w", newline="", encoding="utf-8") as f:
@@ -226,17 +457,34 @@ class BenchmarkEvaluator:
 
             for r in baseline_results + medha_results:
                 writer.writerow([
+                    r.experiment_id,
+                    r.trial_id,
+                    r.trial_index,
+                    ">".join(r.execution_order),
                     r.task_id,
                     r.domain,
                     r.mode,
+                    r.completion_status,
+                    r.quality_eligible,
                     r.success,
                     r.duration_seconds,
-                    r.token_usage.get("total_tokens", 0),
+                    r.token_usage.get("accounted_total_tokens", r.token_usage.get("total_tokens", 0)),
                     r.criteria_coverage_score,
                     len(r.matched_criteria),
                     len(r.missed_criteria),
                     len(r.identified_pitfalls),
                     r.verification_stats.get("support_rate", "N/A"),
+                    r.answer_metrics.get("answer_completeness"),
+                    r.answer_metrics.get("factual_correctness"),
+                    r.answer_metrics.get("unsupported_claim_rate"),
+                    r.answer_metrics.get("evidence_quality"),
+                    r.answer_metrics.get("uncertainty_handling"),
+                    r.answer_metrics.get("task_completion"),
+                    r.cost.get("amount_usd"),
+                    r.cost.get("status", "unknown"),
+                    r.cost.get("usage_source", "unknown"),
+                    r.answer,
+                    r.error,
                 ])
 
         logger.info(f"Saved benchmark CSV report to {target}")
@@ -261,6 +509,8 @@ class BenchmarkEvaluator:
             f"| **Repair Success Rate** | N/A | {_format_pct(mm['repair_success_rate'])} | Precision Fixes |\n",
             f"| **Average Latency** | {bm['avg_latency_seconds']:.2f}s | {mm['avg_latency_seconds']:.2f}s | {round(mm['avg_latency_seconds'] - bm['avg_latency_seconds'], 2):+0.2f}s |\n",
             f"| **Avg Tokens per Task** | {bm['avg_tokens_per_task']:.0f} | {mm['avg_tokens_per_task']:.0f} | {round(mm['avg_tokens_per_task'] - bm['avg_tokens_per_task'], 0):+0.0f} |\n",
-            f"| **Estimated Cost (USD)** | ${bm['estimated_cost_usd']:.4f} | ${mm['estimated_cost_usd']:.4f} | +${round(mm['estimated_cost_usd'] - bm['estimated_cost_usd'], 4):.4f} |\n",
+            f"| **Cost (USD)** | {bm.get('cost_status', 'unknown')}: ${bm['estimated_cost_usd']:.4f} | {mm.get('cost_status', 'unknown')}: ${mm['estimated_cost_usd']:.4f} | Not a significance test |\n",
+            f"| **Latency Variance** | {bm.get('latency_variance_seconds', 'N/A')} | {mm.get('latency_variance_seconds', 'N/A')} | Descriptive only |\n",
+            f"| **Failed Trials** | {bm.get('failure_count', 0)} | {mm.get('failure_count', 0)} | Preserved in trial records |\n",
         ]
         return "".join(md)

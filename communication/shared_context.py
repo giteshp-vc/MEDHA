@@ -15,6 +15,7 @@ class SharedContext:
         self._findings: List[Dict[str, Any]] = []
         self._notes: Dict[str, Any] = {}
         self._agent_statuses: Dict[str, str] = {}
+        self._communications: List[Dict[str, Any]] = []
         self._lock = asyncio.Lock()
 
     async def add_finding(self, agent_id: str, role: str, finding: str) -> None:
@@ -52,6 +53,13 @@ class SharedContext:
         async with self._lock:
             self._agent_statuses[agent_id] = status
 
+    async def add_communication(self, message: Dict[str, Any]) -> None:
+        """Record an attributable communication without treating it as evidence."""
+        async with self._lock:
+            if message.get("task_id") and message["task_id"] != self.task_id:
+                raise ValueError("Communication belongs to a different execution.")
+            self._communications.append(dict(message))
+
     async def format_summary(self) -> str:
         """Generate a concise formatted summary of shared state for prompt inclusion."""
         async with self._lock:
@@ -75,5 +83,6 @@ class SharedContext:
                 "findings": list(self._findings),
                 "notes": dict(self._notes),
                 "agent_statuses": dict(self._agent_statuses),
+                "communications": list(self._communications),
             }
 

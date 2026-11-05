@@ -209,6 +209,44 @@ def test_claim_validator_flags_fabricated_empirical_evidence():
     assert any("benchmarks proved" in issue or "empirical test result" in issue for issue in issues)
 
 
+@pytest.mark.parametrize(
+    "reference",
+    ["ev_not_registered", "https://example.invalid/performance-report"],
+)
+def test_unresolved_id_or_agent_url_is_not_external_evidence(reference):
+    claim = Claim(
+        claim_id="c_unresolved_reference",
+        claim_text="We measured throughput of 20,000 requests per second.",
+        originating_agent="agent_perf",
+        claim_kind=ClaimKind.EMPIRICAL_RESULT,
+        evidence_references=[reference],
+    )
+
+    is_valid, issues = ClaimValidator.validate_claim_structure(claim)
+
+    assert is_valid is False
+    assert any("no external evidence" in issue.lower() for issue in issues)
+
+
+@pytest.mark.parametrize(
+    "reference",
+    ["evidence_id_not_in_ledger", "https://example.invalid/benchmark-report"],
+)
+def test_unresolved_reference_or_agent_url_is_not_external_evidence(reference):
+    claim = Claim(
+        claim_id="c_unresolved_ref",
+        claim_text="We measured throughput of 20,000 requests per second.",
+        originating_agent="agent_perf",
+        claim_kind=ClaimKind.EMPIRICAL_RESULT,
+        evidence_references=[reference],
+    )
+
+    is_valid, issues = ClaimValidator.validate_claim_structure(claim)
+
+    assert is_valid is False
+    assert any("no external evidence" in issue.lower() for issue in issues)
+
+
 def test_claim_extractor_distinguishes_targets_assumptions_recommendations_and_results():
     from verification.claim_extractor import classify_claim_kind
 

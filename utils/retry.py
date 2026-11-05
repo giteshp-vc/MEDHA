@@ -253,6 +253,7 @@ async def execute_with_retry(
     initial_delay: float = INITIAL_RETRY_DELAY,
     max_delay: float = MAX_RETRY_DELAY,
     timeout_seconds: Optional[float] = None,
+    on_attempt_failure: Optional[Callable[[int, Exception], None]] = None,
 ) -> T:
     """Execute an async operation with exponential backoff, random jitter, and error classification.
 
@@ -271,6 +272,12 @@ async def execute_with_retry(
         except Exception as exc:
             attempt += 1
             is_retryable, classified_err = classify_error(exc)
+            if on_attempt_failure is not None:
+                try:
+                    on_attempt_failure(attempt, classified_err)
+                except Exception:
+                    # Telemetry callbacks must never change provider retry behavior.
+                    pass
 
             if not is_retryable or attempt > max_retries:
                 logger.error(

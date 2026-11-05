@@ -15,6 +15,7 @@ class WorkflowState(str, Enum):
     INITIALIZED = "INITIALIZED"
     PLANNING = "PLANNING"
     EXECUTING_SUBTASKS = "EXECUTING_SUBTASKS"
+    DELIBERATING = "DELIBERATING"
     EXTRACTING_CLAIMS = "EXTRACTING_CLAIMS"
     AUDITING_CLAIMS = "AUDITING_CLAIMS"
     REPAIRING_CLAIMS = "REPAIRING_CLAIMS"
@@ -23,6 +24,7 @@ class WorkflowState(str, Enum):
     SUCCESS = "SUCCESS"
     PARTIAL_FAILURE = "PARTIAL_FAILURE"
     FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
 
 
 class StageRecord(BaseModel):
@@ -76,6 +78,17 @@ class WorkflowTracker:
 
         self.current_state = WorkflowState.FAILED
         logger.error(f"Workflow [{self.execution_id}] FAILED: {error_message}")
+
+    def cancel(self, reason: str) -> None:
+        """Mark the active workflow stage cancelled without reporting it as a failure."""
+        now_perf = time.perf_counter()
+        if self._current_stage_record:
+            self._current_stage_record.end_time = utcnow_iso()
+            self._current_stage_record.duration_seconds = round(now_perf - self._stage_start_perf, 3)
+            self._current_stage_record.status = "CANCELLED"
+            self._current_stage_record.details["cancellation_reason"] = reason
+        self.current_state = WorkflowState.CANCELLED
+        logger.warning(f"Workflow [{self.execution_id}] CANCELLED: {reason}")
 
     def get_summary(self) -> List[Dict[str, Any]]:
         """Return history of all completed stages."""

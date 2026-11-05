@@ -20,6 +20,8 @@ class TaskStatus(str, Enum):
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
     BLOCKED = "BLOCKED"
+    TIMED_OUT = "TIMED_OUT"
+    CANCELLED = "CANCELLED"
 
 
 class AgentStatus(str, Enum):
@@ -31,6 +33,8 @@ class AgentStatus(str, Enum):
     WAITING = "WAITING"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
+    TIMED_OUT = "TIMED_OUT"
+    CANCELLED = "CANCELLED"
 
 
 class MessageType(str, Enum):
@@ -43,6 +47,12 @@ class MessageType(str, Enum):
     EVIDENCE = "EVIDENCE"
     CORRECTION = "CORRECTION"
     STATUS = "STATUS"
+    EVIDENCE_REQUEST = "EVIDENCE_REQUEST"
+    EVIDENCE_RESPONSE = "EVIDENCE_RESPONSE"
+    CLARIFICATION = "CLARIFICATION"
+    AGREEMENT = "AGREEMENT"
+    DISAGREEMENT = "DISAGREEMENT"
+    HANDOFF = "HANDOFF"
 
 
 class ClaimStatus(str, Enum):
