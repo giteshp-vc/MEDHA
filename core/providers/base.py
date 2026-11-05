@@ -69,16 +69,18 @@ class BaseLLMClient(ABC):
         estimated_prompt_tokens: Optional[int],
     ):
         """Create common telemetry around one actual provider transport attempt."""
-        model_version = MODEL_VERSION.strip() if MODEL_VERSION and MODEL_VERSION.strip() else None
-        if model_version and model_version.casefold() == "unknown":
-            model_version = None
+        operator_model_version = MODEL_VERSION.strip() if MODEL_VERSION and MODEL_VERSION.strip() else None
+        if operator_model_version and operator_model_version.casefold() == "unknown":
+            operator_model_version = None
         return self.token_tracker.provider_call(
             attempt_number=attempt_number,
             retry_number=retry_number,
             is_fallback=is_fallback,
+            operator_model_version=operator_model_version,
+            model_identifier_policy="provider_may_resolve_mutable_alias",
             provider=self.__class__.__name__.removesuffix("Client").lower(),
             model=model,
-            model_version=model_version,
+            model_version=None,
             temperature=temperature,
             input_token_limit=self.token_tracker.max_input_tokens_per_call,
             output_token_limit=output_token_limit,
@@ -130,6 +132,8 @@ class BaseLLMClient(ABC):
                             pass
                     response = await request()
                     response_received = True
+                    if call_recorder is not None:
+                        call_recorder.set_response_metadata(response)
                 # The provider call succeeded even if local accounting later reports an over-budget response.
                 await usage_callback(response, call_recorder)
             return response, call_recorder

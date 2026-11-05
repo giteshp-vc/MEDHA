@@ -12,6 +12,7 @@ from config.settings import (
     MAX_OUTPUT_TOKENS_PER_CALL,
     MAX_RETRIES,
     MAX_RETRY_DELAY,
+    PROVIDER_REQUEST_TIMEOUT_SECONDS,
     TEMPERATURE,
     validate_settings,
 )
@@ -124,6 +125,11 @@ class GeminiClient(BaseLLMClient):
         target_model = model or self.default_model
         temp = temperature if temperature is not None else TEMPERATURE
         output_limit = max_tokens or MAX_OUTPUT_TOKENS_PER_CALL
+        timeout_seconds = (
+            timeout_seconds
+            if timeout_seconds is not None
+            else PROVIDER_REQUEST_TIMEOUT_SECONDS
+        )
 
         config = types.GenerateContentConfig(
             temperature=temp,
@@ -191,6 +197,11 @@ class GeminiClient(BaseLLMClient):
         target_model = model or self.default_model
         temp = temperature if temperature is not None else TEMPERATURE
         output_limit = max_tokens or MAX_OUTPUT_TOKENS_PER_CALL
+        timeout_seconds = (
+            timeout_seconds
+            if timeout_seconds is not None
+            else PROVIDER_REQUEST_TIMEOUT_SECONDS
+        )
 
         config = types.GenerateContentConfig(
             temperature=temp,

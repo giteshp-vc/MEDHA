@@ -2,14 +2,26 @@ import csv
 import json
 import asyncio
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from benchmark.evaluator import BenchmarkEvaluator
-from benchmark.experiment import WILLIAMS_SEQUENCES, balanced_sequence
+from benchmark.experiment import (
+    BenchmarkArmResult,
+    BenchmarkConfigurationSnapshot,
+    BenchmarkEvaluationResult,
+    BenchmarkExperiment,
+    BenchmarkTaskBlock,
+    BenchmarkTrial,
+    MetricMeasurement,
+    WILLIAMS_SEQUENCES,
+    balanced_sequence,
+)
 from benchmark.four_arm import _cost_for
-from benchmark.experiment import BenchmarkEvaluationResult
+from benchmark.four_arm import FourArmBenchmark
+from models.provider_call import ProviderCallRecord
 from models.frozen_plan import FrozenTaskPlan
 from models.provider_call import (
     AccountingContext,
@@ -21,7 +33,17 @@ from models.provider_call import (
 from models.task_models import SubTask, TaskPlan
 
 
-def _snapshot(context, *, total_tokens=12, dropped=0, model="mock-model"):
+def _snapshot(
+    context,
+    *,
+    total_tokens=12,
+    dropped=0,
+    model="mock-model",
+    model_version="v1",
+    model_version_source="provider_response",
+    timeout_seconds=30,
+    timeout_source="explicit_request",
+):
     call = ProviderCallRecord(
         experiment_id=context.experiment_id,
         task_block_id=context.task_block_id,
@@ -36,11 +58,13 @@ def _snapshot(context, *, total_tokens=12, dropped=0, model="mock-model"):
         ),
         provider="groq",
         model=model,
-        model_version="v1",
+        model_version=model_version,
+        model_version_source=model_version_source,
         temperature=0.2,
         input_token_limit=1000,
         output_token_limit=100,
-        timeout_seconds=30,
+        timeout_seconds=timeout_seconds,
+        timeout_source=timeout_source,
         prompt_tokens=8,
         candidate_tokens=4,
         total_tokens=12,
@@ -56,7 +80,8 @@ def _snapshot(context, *, total_tokens=12, dropped=0, model="mock-model"):
             "total_tokens": total_tokens,
             "accounted_total_tokens": total_tokens,
             "usage_source": "provider",
-            "total_requests": 1,
+            "total_requests": 1 + dropped,
+            "failed_requests": 0,
         },
         provider_calls=[call],
         dropped_provider_call_records=dropped,
@@ -64,10 +89,11 @@ def _snapshot(context, *, total_tokens=12, dropped=0, model="mock-model"):
 
 
 class FakeBaseline:
-    def __init__(self, config=None, effective_model="mock-model"):
+    def __init__(self, config=None, effective_model="mock-model", missing_provider_metadata=False):
         self.calls = []
         self.config = config or _configuration()
         self.effective_model = effective_model
+        self.missing_provider_metadata = missing_provider_metadata
 
     def benchmark_configuration(self):
         return self.config
@@ -86,7 +112,14 @@ class FakeBaseline:
             success=True,
             error=None,
             token_usage={},
-            accounting=_snapshot(context, model=self.effective_model),
+            accounting=_snapshot(
+                context,
+                model=self.effective_model,
+                model_version=None if self.missing_provider_metadata else "v1",
+                model_version_source="unavailable" if self.missing_provider_metadata else "provider_response",
+                timeout_seconds=None if self.missing_provider_metadata else 30,
+                timeout_source="provider_sdk_default" if self.missing_provider_metadata else "explicit_request",
+            ),
         )
 
 
@@ -104,12 +137,23 @@ def _configuration():
 
 
 class FakeOrchestrator:
-    def __init__(self, *, planning_error=None, interrupt_arm=None):
+    def __init__(self, *, planning_error=None, interrupt_arm=None, missing_provider_metadata=False):
         self.prepare_calls = []
         self.planned_calls = []
         self.copy_ids = []
         self.planning_error = planning_error
         self.interrupt_arm = interrupt_arm
+        self.missing_provider_metadata = missing_provider_metadata
+
+    def _snapshot(self, context, **kwargs):
+        if self.missing_provider_metadata:
+            kwargs.update(
+                model_version=None,
+                model_version_source="unavailable",
+                timeout_seconds=None,
+                timeout_source="provider_sdk_default",
+            )
+        return _snapshot(context, **kwargs)
 
     async def prepare_frozen_plan(self, task, accounting_context=None):
         self.prepare_calls.append((task, accounting_context))
@@ -128,7 +172,7 @@ class FakeOrchestrator:
         return FrozenTaskPlan.from_plan(
             task,
             plan,
-            preparation_accounting=_snapshot(AccountingContext(
+            preparation_accounting=self._snapshot(AccountingContext(
                 experiment_id=accounting_context.experiment_id,
                 task_block_id=accounting_context.task_block_id,
                 execution_id="plan-exec",
@@ -170,15 +214,19 @@ class FakeOrchestrator:
                 "unsupported_rate": 0.5,
                 "repair_success_rate": 0.25,
             },
-            accounting=_snapshot(context, dropped=int(accounting_context.treatment_id == "DEPENDENCY_AWARE")),
+            accounting=self._snapshot(
+                context,
+                dropped=int(accounting_context.treatment_id == "DEPENDENCY_AWARE"),
+            ),
         )
 
 
 class FakeMedhaRunner:
-    def __init__(self, *, config=None, planning_error=None, interrupt_arm=None):
+    def __init__(self, *, config=None, planning_error=None, interrupt_arm=None, missing_provider_metadata=False):
         self.orchestrator = FakeOrchestrator(
             planning_error=planning_error,
             interrupt_arm=interrupt_arm,
+            missing_provider_metadata=missing_provider_metadata,
         )
         self.config = config or _configuration()
 
@@ -209,6 +257,158 @@ def test_williams_sequences_balance_positions_and_directed_carryovers():
     assert len(set(carryovers)) == 12
 
 
+def test_smoke_fixture_operational_aggregates_include_incompatible_attempts():
+    fixture_path = Path(__file__).parent / "fixtures" / "four_arm_smoke_minimal.json"
+    fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+    trials = []
+    for repetition, item in enumerate(fixture["trials"], start=1):
+        provider_calls = [
+            ProviderCallRecord(
+                attempt_number=index + 1,
+                provider=fixture["configuration"]["provider"],
+                model=fixture["configuration"]["model"],
+                model_version=fixture["configuration"]["model_version"],
+                model_version_source="unavailable",
+                temperature=0.2,
+                input_token_limit=12000,
+                output_token_limit=2048,
+                timeout_seconds=fixture["configuration"]["timeout_seconds"],
+                timeout_source="provider_sdk_default",
+                status=(
+                    ProviderCallStatus.FAILED
+                    if index < item["failed_provider_request_count"]
+                    else ProviderCallStatus.SUCCEEDED
+                ),
+            )
+            for index in range(item["provider_request_count"])
+        ]
+        context = AccountingContext(
+            experiment_id="smoke-minimal",
+            task_block_id="block_0001",
+            trial_id=f"smoke-minimal:{item['arm_id']}",
+            treatment_id=item["arm_id"],
+            execution_id=f"exec-{item['arm_id']}",
+            scope_kind="trial_execution",
+        )
+        accounting = AccountingSnapshot(
+            context=context,
+            duration_seconds=item["duration_seconds"],
+            token_usage={
+                "prompt_tokens": item["input_tokens"],
+                "candidate_tokens": item["output_tokens"],
+                "total_tokens": item["provider_reported_total_tokens"],
+                "estimated_tokens_without_usage": item["estimated_total_tokens"],
+                "accounted_total_tokens": item["total_tokens"],
+                "usage_source": item["usage_source"],
+            },
+            provider_calls=provider_calls,
+        )
+        compatible = fixture["configuration"]["all_arms_compatible"]
+        result = BenchmarkArmResult(
+            experiment_id="smoke-minimal",
+            task_block_id="block_0001",
+            trial_id=context.trial_id,
+            execution_id=context.execution_id,
+            arm_id=item["arm_id"],
+            task_id="smoke-case",
+            repetition=1,
+            start_timestamp="2026-11-05T00:00:00+00:00",
+            end_timestamp="2026-11-05T00:00:01+00:00",
+            duration_seconds=item["duration_seconds"],
+            status=item["status"],
+            success=item["success"],
+            quality_eligible=item["success"],
+            metrics={
+                "answer_completeness": MetricMeasurement(
+                    value=0.0 if item["success"] else 1.0,
+                    eligible_sample_count=int(item["success"]),
+                    attempt_count=1,
+                    missing_count=int(not item["success"]),
+                    missingness_reason=None if item["success"] else "output_ineligible",
+                ),
+                "verification_support_rate": MetricMeasurement(
+                    value=None,
+                    attempt_count=1,
+                    missing_count=1,
+                    missingness_reason="not_applicable" if item["arm_id"] == "BASELINE" else "verification_unavailable",
+                ),
+            },
+            provider_call_records=provider_calls,
+            accounting=accounting,
+            trial_execution_cost={"amount_usd": None, "status": "unknown"},
+            telemetry_complete=True,
+            configuration=BenchmarkConfigurationSnapshot(
+                provider_configuration={
+                    "provider": fixture["configuration"]["provider"],
+                    "model": fixture["configuration"]["model"],
+                },
+                compatible=compatible,
+                compatibility_status="INCOMPATIBLE",
+                compatibility_assessments={
+                    "provider_model_revision": {"status": "unavailable"},
+                    "request_timeout_seconds": {"status": "unavailable"},
+                },
+                compatibility_limitations=["revision and default timeout are unavailable"],
+                compatibility_differences={"fixture": "marked incompatible per source artifact"},
+            ),
+        )
+        trial_id = result.trial_id
+        trials.append(BenchmarkTrial(
+            trial_id=trial_id,
+            task_block_id="block_0001",
+            repetition=repetition,
+            arm_id=item["arm_id"],
+            planned_order=[item["arm_id"]],
+            actual_order=[item["arm_id"]],
+            result=result,
+        ))
+
+    experiment = BenchmarkExperiment(
+        experiment_id="smoke-minimal",
+        created_at="2026-11-05T00:00:00+00:00",
+        repetitions=1,
+        task_blocks=[BenchmarkTaskBlock(
+            task_block_id="block_0001",
+            task_id="smoke-case",
+            task_text="sanitized task reference",
+            trials=trials,
+        )],
+    )
+    aggregate_runner = FourArmBenchmark.__new__(FourArmBenchmark)
+    operational, comparative, legacy = aggregate_runner._aggregate(experiment)
+    total_operational = {
+        name: sum(arm[name] for arm in operational.values())
+        for name in ("attempt_count", "successful_completion_count", "failure_or_interruption_count")
+    }
+
+    assert total_operational == {
+        "attempt_count": 4,
+        "successful_completion_count": 1,
+        "failure_or_interruption_count": 3,
+    }
+    assert operational["INDEPENDENT_PARALLEL"]["provider_request_count"]["value"] == 11
+    assert operational["INDEPENDENT_PARALLEL"]["failed_provider_request_count"]["value"] == 2
+    assert operational["FULL_MEDHA"]["provider_request_count"]["value"] == 4
+    assert operational["DEPENDENCY_AWARE"]["provider_request_count"]["value"] == 12
+    assert sum(arm["provider_request_count"]["value"] for arm in operational.values()) == 28
+    assert sum(arm["failed_provider_request_count"]["value"] for arm in operational.values()) == 5
+    assert sum(arm["tokens"]["total_tokens"]["value"] for arm in operational.values()) == 97173
+    assert sum(arm["tokens"]["estimated_tokens"]["value"] for arm in operational.values()) == 21721
+    assert sum(arm["tokens"]["provider_reported_total_tokens"]["value"] for arm in operational.values()) == 75452
+    assert operational["BASELINE"]["success_rate"] == 1.0
+    assert comparative["BASELINE"]["success_rate"] is None
+    assert comparative["BASELINE"]["answer_quality_metrics"]["answer_completeness"]["value"] is None
+    assert comparative["BASELINE"]["answer_quality_metrics"]["answer_completeness"]["missingness_reasons"] == {
+        "configuration_incompatible": 1
+    }
+    assert comparative["BASELINE"]["answer_quality_metrics"]["answer_completeness"]["attempt_count"] == 1
+    assert comparative["BASELINE"]["answer_quality_metrics"]["answer_completeness"]["missing_count"] == 1
+    assert legacy["BASELINE"]["success_rate"] == 1.0
+    assert legacy["INDEPENDENT_PARALLEL"]["failure_or_interruption_count"] == 1
+    assert operational["BASELINE"]["trial_execution_cost"]["amount_usd"] is None
+    assert operational["BASELINE"]["trial_execution_cost"]["unknown_cost_count"] == 1
+
+
 @pytest.mark.parametrize("usage_source", ["estimated", "mixed"])
 def test_cost_does_not_price_estimated_or_mixed_usage_as_zero(usage_source):
     cost = _cost_for(
@@ -228,6 +428,124 @@ def test_cost_does_not_price_estimated_or_mixed_usage_as_zero(usage_source):
     )
     assert cost["status"] == usage_source
     assert cost["amount_usd"] is None
+
+
+def test_missing_model_revision_and_sdk_default_timeout_are_nonblocking_limitations():
+    baseline = {**_configuration(), "model_version": "unknown", "provider_request_timeout_seconds": None}
+    medha = {**_configuration(), "model_version": None, "provider_request_timeout_seconds": None}
+
+    differences = FourArmBenchmark._configuration_differences({
+        "BASELINE": baseline,
+        "MEDHA": medha,
+    })
+    assessments, limitations = FourArmBenchmark._configuration_assessments({
+        "BASELINE": baseline,
+        "MEDHA": medha,
+    })
+
+    assert differences == {}
+    assert assessments["provider_model_revision"]["status"] == "unavailable"
+    assert assessments["request_timeout_mode"]["status"] == "known_equal"
+    assert assessments["request_timeout_seconds"]["status"] == "unavailable"
+    assert assessments["plan_preparation_for_baseline"]["status"] == "not_applicable"
+    assert any("mutable aliases" in item for item in limitations)
+    assert any("provider-managed" in item for item in limitations)
+
+
+@pytest.mark.parametrize(
+    ("field", "baseline_value", "medha_value"),
+    [
+        ("provider", "groq", "gemini"),
+        ("model", "model-a", "model-b"),
+        ("temperature", 0.2, 0.4),
+        ("output_token_limit", 2048, 1024),
+        ("provider_request_timeout_seconds", 10.0, 20.0),
+    ],
+)
+def test_known_provider_and_generation_configuration_differences_are_rejected(
+    field,
+    baseline_value,
+    medha_value,
+):
+    baseline = {**_configuration(), field: baseline_value}
+    medha = {**_configuration(), field: medha_value}
+
+    differences = FourArmBenchmark._configuration_differences({
+        "BASELINE": baseline,
+        "MEDHA": medha,
+    })
+
+    assert field in differences
+
+
+def test_operational_aggregates_preserve_partial_telemetry_denominators():
+    context = AccountingContext(
+        experiment_id="partial-telemetry",
+        task_block_id="block-1",
+        trial_id="known",
+        execution_id="exec-known",
+        scope_kind="trial_execution",
+    )
+    known_accounting = AccountingSnapshot(
+        context=context,
+        duration_seconds=0.1,
+        token_usage={
+            "prompt_tokens": 9,
+            "candidate_tokens": 4,
+            "total_tokens": 13,
+            "accounted_total_tokens": 13,
+            "estimated_tokens_without_usage": 0,
+            "usage_source": "provider",
+        },
+    )
+    common = {
+        "experiment_id": "partial-telemetry",
+        "task_block_id": "block-1",
+        "arm_id": "BASELINE",
+        "task_id": "case",
+        "repetition": 1,
+        "start_timestamp": "start",
+        "end_timestamp": "end",
+        "status": "SUCCESS",
+        "success": True,
+        "quality_eligible": True,
+        "configuration": BenchmarkConfigurationSnapshot(compatible=True),
+        "trial_execution_cost": {"amount_usd": None, "status": "unknown"},
+    }
+    known = BenchmarkArmResult(
+        **common,
+        trial_id="known",
+        execution_id="exec-known",
+        duration_seconds=0.1,
+        accounting=known_accounting,
+    )
+    missing = BenchmarkArmResult(
+        **{**common, "status": "FAILED", "success": False, "quality_eligible": False},
+        trial_id="missing",
+        execution_id="exec-missing",
+        duration_seconds=0.2,
+    )
+
+    operational = FourArmBenchmark._aggregate_operational([known, missing])
+
+    assert operational["attempt_count"] == 2
+    assert operational["success_rate"] == 0.5
+    assert operational["provider_request_count"] == {
+        "value": 0,
+        "attempt_count": 2,
+        "available_attempt_count": 1,
+        "missing_count": 1,
+        "missingness_reason": "provider-call records unavailable",
+    }
+    assert operational["tokens"]["input_tokens"]["value"] == 9
+    assert operational["tokens"]["input_tokens"]["available_attempt_count"] == 1
+    assert operational["tokens"]["input_tokens"]["missing_count"] == 1
+
+    empty = FourArmBenchmark._aggregate_operational([])
+    assert empty["attempt_count"] == 0
+    assert empty["provider_request_count"]["value"] is None
+    assert empty["tokens"]["total_tokens"]["value"] is None
+    assert empty["latency"]["average_seconds"] is None
 
 
 @pytest.mark.asyncio
@@ -293,7 +611,8 @@ async def test_four_arm_experiment_reuses_plan_isolates_trials_and_exports(tmp_p
     assert not dependency_trial.telemetry_complete
     assert result.aggregate_results["BASELINE"]["verification_metrics"]["support_rate"] is None
     assert result.experiment.scoring_policy["factual_correctness"] is None
-    assert result.aggregate_results["DEPENDENCY_AWARE"]["provider_request_count"] == 1
+    assert result.aggregate_results["DEPENDENCY_AWARE"]["provider_request_count"] == 2
+    assert result.operational_aggregates["DEPENDENCY_AWARE"]["retry_and_fallback_counts_are_lower_bounds"] is True
 
     plan_amount = (
         block.plan_preparation_accounting.token_usage["prompt_tokens"] * 1.0
@@ -404,8 +723,38 @@ async def test_configuration_mismatch_is_preserved_but_not_aggregated(tmp_path):
     assert result.experiment.configuration_snapshots["BASELINE"].compatible is False
     assert "model" in result.experiment.configuration_snapshots["BASELINE"].compatibility_differences
     assert result.aggregate_results["BASELINE"]["incompatible_attempt_count"] == 1
-    assert result.aggregate_results["BASELINE"]["success_rate"] is None
+    assert result.aggregate_results["BASELINE"]["success_rate"] == 1.0
+    assert result.comparative_aggregates["BASELINE"]["success_rate"] is None
     assert result.aggregate_results["FULL_MEDHA"]["incompatible_attempt_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_unavailable_revision_and_default_timeout_are_nonblocking_in_final_experiment(tmp_path):
+    dataset_path = tmp_path / "cases.json"
+    dataset_path.write_text('[{"id":"metadata-unavailable","prompt":"Task"}]', encoding="utf-8")
+    config = {
+        **_configuration(),
+        "model_version": "unknown",
+        "provider_request_timeout_seconds": None,
+    }
+    evaluator = BenchmarkEvaluator(
+        dataset_path=dataset_path,
+        baseline_runner=FakeBaseline(config=config, missing_provider_metadata=True),
+        medha_runner=FakeMedhaRunner(config=config, missing_provider_metadata=True),
+    )
+
+    result = await evaluator.run_experiment(
+        experiment_id="metadata-unavailable",
+        output_directory=tmp_path / "exports",
+    )
+
+    for snapshot in result.experiment.configuration_snapshots.values():
+        assert snapshot.compatible is True
+        assert snapshot.compatibility_status == "COMPATIBLE_WITH_LIMITATIONS"
+        assert "mutable provider-managed alias" in snapshot.model_revision_policy
+        assert snapshot.compatibility_assessments["provider_model_revision"]["status"] == "unavailable"
+        assert snapshot.compatibility_assessments["request_timeout_seconds"]["status"] == "unavailable"
+    assert result.comparative_aggregates["BASELINE"]["compatible_attempt_count"] == 1
 
 
 @pytest.mark.asyncio
@@ -424,11 +773,12 @@ async def test_effective_provider_configuration_mismatch_is_detected(tmp_path):
     )
 
     differences = result.experiment.configuration_snapshots["BASELINE"].compatibility_differences
-    assert differences["BASELINE.baseline.model"] == {
+    assert differences["BASELINE.effective_call.model"] == {
         "configured": "mock-model",
         "effective": "unexpected-model",
     }
-    assert result.aggregate_results["BASELINE"]["success_rate"] is None
+    assert result.aggregate_results["BASELINE"]["success_rate"] == 1.0
+    assert result.comparative_aggregates["BASELINE"]["success_rate"] is None
 
 
 @pytest.mark.asyncio

@@ -236,6 +236,8 @@ The evaluator prepares one frozen plan per task block and reuses it for arms B, 
 
 Results are exploratory and do not claim statistical significance. Configuration mismatches or unknown required settings remain visible in trial records and exclude incompatible trials from comparative aggregates. Automated completeness, pitfall, uncertainty, and evidence-quality metrics are proxies, not factual correctness. No human factual score is fabricated; factual correctness remains null without an actual blinded human or independent expert score.
 
+Provider-reported immutable model revisions and provider SDK default timeout durations may be unavailable. These are recorded as unavailable compatibility limitations, not assumed equal and not alone grounds to reject an otherwise matching requested configuration. `MODEL_VERSION` is an operator-supplied label, not provider-attested revision metadata. Set `PROVIDER_REQUEST_TIMEOUT_SECONDS` to apply and record an explicit request timeout; blank uses the provider SDK default.
+
 Only a nonempty successful output is eligible for answer-quality aggregates. Failed, partial, empty, and interrupted attempts remain in the JSON/CSV outputs with diagnostics and any available answer. Verification metrics for arm A are null/N/A because verification is not executed. Missing values retain eligible counts, attempt counts, and missingness reasons in JSON.
 
 Token counts come from the `AccountingSnapshot`; provider-call records are used for request, retry, failure, duration, and dropped-record telemetry, avoiding double counting. Costs require explicit provider/model input and output pricing. Missing pricing or usage remains unknown, and estimated/mixed usage keeps its provenance label.

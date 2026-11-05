@@ -113,6 +113,17 @@ class ProviderCallRecorder:
         elif self.record.usage_source == ProviderUsageSource.UNAVAILABLE:
             self.record.usage_source = ProviderUsageSource.LOCALLY_ESTIMATED
 
+    def set_response_metadata(self, response: Any) -> None:
+        if not self.enabled:
+            return
+        response_model = getattr(response, "model", None)
+        if isinstance(response_model, str) and response_model.strip():
+            self.record.response_model = response_model.strip()
+        response_revision = getattr(response, "model_version", None)
+        if isinstance(response_revision, str) and response_revision.strip():
+            self.record.model_version = response_revision.strip()
+            self.record.model_version_source = "provider_response"
+
     def finish(self, status: ProviderCallStatus, error: Optional[BaseException] = None) -> None:
         if not self.enabled:
             return
@@ -253,6 +264,8 @@ class TokenTracker:
         attempt_number: int,
         retry_number: int = 0,
         is_fallback: bool = False,
+        operator_model_version: Optional[str] = None,
+        model_identifier_policy: str = "provider_may_resolve_mutable_alias",
         provider: str,
         model: Optional[str],
         model_version: Optional[str],
@@ -272,6 +285,8 @@ class TokenTracker:
                     attempt_number=attempt_number,
                     retry_number=retry_number,
                     is_fallback=is_fallback,
+                    operator_model_version=operator_model_version,
+                    model_identifier_policy=model_identifier_policy,
                     provider=provider,
                     model=model,
                     model_version=model_version,
@@ -300,6 +315,10 @@ class TokenTracker:
                 attempt_number=attempt_number,
                 retry_number=retry_number,
                 is_fallback=is_fallback,
+                operator_model_version=operator_model_version,
+                model_identifier_policy=model_identifier_policy,
+                model_version_source="unavailable",
+                timeout_source=("explicit_request" if timeout_seconds is not None else "provider_sdk_default"),
                 provider=provider,
                 model=model,
                 model_version=model_version,

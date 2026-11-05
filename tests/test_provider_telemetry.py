@@ -26,6 +26,8 @@ def _response(
     prompt_tokens=None,
     candidate_tokens=None,
     total_tokens=None,
+    model_version=None,
+    model=None,
 ):
     usage = None
     if any(value is not None for value in (prompt_tokens, candidate_tokens, total_tokens)):
@@ -35,7 +37,13 @@ def _response(
             total_token_count=total_tokens,
             cached_content_token_count=None,
         )
-    return SimpleNamespace(text=text, parsed=None, usage_metadata=usage)
+    return SimpleNamespace(
+        text=text,
+        parsed=None,
+        usage_metadata=usage,
+        model_version=model_version,
+        model=model,
+    )
 
 
 def _mock_gemini_client(side_effect=None, return_value=None):
@@ -104,7 +112,12 @@ async def test_successful_provider_call_records_effective_config_and_actual_usag
     assert record.attempt_number == 1
     assert record.provider == "gemini"
     assert record.model == "mock-model"
-    assert record.model_version == "mock-v7"
+    assert record.model_version is None
+    assert record.operator_model_version == "mock-v7"
+    assert record.model_version_source == "unavailable"
+    assert record.model_identifier_policy == "provider_may_resolve_mutable_alias"
+    assert record.timeout_seconds is None
+    assert record.timeout_source == "provider_sdk_default"
     assert record.temperature == 0.73
     assert record.output_token_limit == 61
     assert record.prompt_tokens == 13
@@ -118,6 +131,32 @@ async def test_successful_provider_call_records_effective_config_and_actual_usag
     assert record.agent_role == "Final Synthesizer"
     assert sdk.aio.models.generate_content.await_args.kwargs["config"].temperature == 0.73
     assert sdk.aio.models.generate_content.await_args.kwargs["config"].max_output_tokens == 61
+
+
+@pytest.mark.asyncio
+async def test_provider_response_revision_and_response_model_are_captured():
+    client, tracker, _ = _mock_gemini_client(
+        return_value=_response("safe answer", model_version="gemini-revision-7", model="mock-model-7")
+    )
+
+    _, snapshot = await _run_scoped_text_call(client, tracker)
+
+    record = snapshot.provider_calls[0]
+    assert record.model_version == "gemini-revision-7"
+    assert record.model_version_source == "provider_response"
+    assert record.response_model == "mock-model-7"
+
+
+@pytest.mark.asyncio
+async def test_explicit_timeout_is_recorded_at_provider_call_boundary(monkeypatch):
+    monkeypatch.setattr("core.providers.gemini_client.PROVIDER_REQUEST_TIMEOUT_SECONDS", 8.5)
+    client, tracker, _ = _mock_gemini_client(return_value=_response("bounded response"))
+
+    _, snapshot = await _run_scoped_text_call(client, tracker)
+
+    record = snapshot.provider_calls[0]
+    assert record.timeout_seconds == 8.5
+    assert record.timeout_source == "explicit_request"
 
 
 @pytest.mark.asyncio

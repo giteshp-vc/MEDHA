@@ -11,6 +11,7 @@ from config.settings import (
     MAX_OUTPUT_TOKENS_PER_CALL,
     MAX_RETRIES,
     MAX_RETRY_DELAY,
+    PROVIDER_REQUEST_TIMEOUT_SECONDS,
     TEMPERATURE,
     validate_settings,
 )
@@ -170,6 +171,11 @@ class GroqClient(BaseLLMClient):
         target_model = model or self.default_model
         temp = temperature if temperature is not None else TEMPERATURE
         output_limit = max_tokens or MAX_OUTPUT_TOKENS_PER_CALL
+        timeout_seconds = (
+            timeout_seconds
+            if timeout_seconds is not None
+            else PROVIDER_REQUEST_TIMEOUT_SECONDS
+        )
 
         messages: List[Dict[str, str]] = []
         if system_instruction:
@@ -249,6 +255,11 @@ class GroqClient(BaseLLMClient):
         target_model = model or self.default_model
         temp = temperature if temperature is not None else TEMPERATURE
         output_limit = max_tokens or MAX_OUTPUT_TOKENS_PER_CALL
+        timeout_seconds = (
+            timeout_seconds
+            if timeout_seconds is not None
+            else PROVIDER_REQUEST_TIMEOUT_SECONDS
+        )
 
         schema_json = json.dumps(response_schema.model_json_schema(), indent=2)
         schema_instruction = (

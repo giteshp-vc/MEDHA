@@ -22,6 +22,10 @@ GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 MODEL_VERSION = os.getenv("MODEL_VERSION", "unknown")
+_PROVIDER_REQUEST_TIMEOUT_RAW = os.getenv("PROVIDER_REQUEST_TIMEOUT_SECONDS", "").strip()
+PROVIDER_REQUEST_TIMEOUT_SECONDS = (
+    float(_PROVIDER_REQUEST_TIMEOUT_RAW) if _PROVIDER_REQUEST_TIMEOUT_RAW else None
+)
 
 TEMPERATURE = float(os.getenv("TEMPERATURE", "0.2"))
 
@@ -96,6 +100,11 @@ def validate_settings() -> bool:
 
     if not math.isfinite(EXECUTION_TIMEOUT_SECONDS) or EXECUTION_TIMEOUT_SECONDS <= 0:
         raise ValueError("EXECUTION_TIMEOUT_SECONDS must be a finite positive number.")
+    if PROVIDER_REQUEST_TIMEOUT_SECONDS is not None and (
+        not math.isfinite(PROVIDER_REQUEST_TIMEOUT_SECONDS)
+        or PROVIDER_REQUEST_TIMEOUT_SECONDS <= 0
+    ):
+        raise ValueError("PROVIDER_REQUEST_TIMEOUT_SECONDS must be a finite positive number when set.")
 
     if MAX_CLAIMS_PER_TASK < 1:
         raise ValueError("MAX_CLAIMS_PER_TASK must be at least 1.")

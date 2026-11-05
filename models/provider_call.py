@@ -45,6 +45,10 @@ class ProviderCallRecord(BaseSchema):
     attempt_number: int
     retry_number: int = 0
     is_fallback: bool = False
+    operator_model_version: Optional[str] = None
+    model_version_source: str = "unavailable"
+    response_model: Optional[str] = None
+    model_identifier_policy: str = "provider_may_resolve_mutable_alias"
     stage: Optional[str] = None
     agent_id: Optional[str] = None
     agent_role: Optional[str] = None
@@ -55,6 +59,7 @@ class ProviderCallRecord(BaseSchema):
     input_token_limit: Optional[int] = None
     output_token_limit: Optional[int] = None
     timeout_seconds: Optional[float] = None
+    timeout_source: str = "unavailable"
     request_timestamp: str = Field(default_factory=utcnow_iso)
     duration_seconds: Optional[float] = None
     prompt_tokens: Optional[int] = None

@@ -1,0 +1,72 @@
+{
+  "source": "minimized from benchmark/outputs/smoke/medha-smoke-20261105.csv",
+  "configuration": {
+    "provider": "groq",
+    "model": "openai/gpt-oss-20b",
+    "model_version": null,
+    "timeout_seconds": null,
+    "all_arms_compatible": false
+  },
+  "trials": [
+    {
+      "arm_id": "BASELINE",
+      "status": "SUCCESS",
+      "success": true,
+      "duration_seconds": 5.311561,
+      "input_tokens": 137,
+      "output_tokens": 2048,
+      "provider_reported_total_tokens": 2185,
+      "estimated_total_tokens": 0,
+      "total_tokens": 2185,
+      "usage_source": "provider",
+      "provider_request_count": 1,
+      "failed_provider_request_count": 0,
+      "retry_count": 0
+    },
+    {
+      "arm_id": "INDEPENDENT_PARALLEL",
+      "status": "PARTIAL_FAILURE",
+      "success": false,
+      "duration_seconds": 255.538374,
+      "input_tokens": 20130,
+      "output_tokens": 10658,
+      "provider_reported_total_tokens": 30788,
+      "estimated_total_tokens": 11867,
+      "total_tokens": 42655,
+      "usage_source": "mixed",
+      "provider_request_count": 11,
+      "failed_provider_request_count": 2,
+      "retry_count": 0
+    },
+    {
+      "arm_id": "FULL_MEDHA",
+      "status": "PARTIAL_FAILURE",
+      "success": false,
+      "duration_seconds": 58.0891,
+      "input_tokens": 3015,
+      "output_tokens": 2937,
+      "provider_reported_total_tokens": 5952,
+      "estimated_total_tokens": 6639,
+      "total_tokens": 12591,
+      "usage_source": "mixed",
+      "provider_request_count": 4,
+      "failed_provider_request_count": 2,
+      "retry_count": 0
+    },
+    {
+      "arm_id": "DEPENDENCY_AWARE",
+      "status": "PARTIAL_FAILURE",
+      "success": false,
+      "duration_seconds": 273.626691,
+      "input_tokens": 22989,
+      "output_tokens": 13538,
+      "provider_reported_total_tokens": 36527,
+      "estimated_total_tokens": 3215,
+      "total_tokens": 39742,
+      "usage_source": "mixed",
+      "provider_request_count": 12,
+      "failed_provider_request_count": 1,
+      "retry_count": 0
+    }
+  ]
+}

@@ -68,6 +68,7 @@ class SingleAgentBaseline:
             "provider": self.client.__class__.__name__.replace("Client", "").lower(),
             "model": self.model or "unknown",
             "model_version": getattr(settings, "MODEL_VERSION", "unknown"),
+            "provider_request_timeout_seconds": settings.PROVIDER_REQUEST_TIMEOUT_SECONDS,
             "temperature": self.temperature,
             "input_token_limit": tracker.max_input_tokens_per_call,
             "output_token_limit": tracker.max_output_tokens_per_call,

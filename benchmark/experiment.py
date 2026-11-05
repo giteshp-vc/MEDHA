@@ -32,6 +32,10 @@ class BenchmarkConfigurationSnapshot(BaseSchema):
     python_version: Optional[str] = None
     dependency_versions: Dict[str, Optional[str]] = Field(default_factory=dict)
     provider_configuration: Dict[str, Any] = Field(default_factory=dict)
+    model_revision_policy: str = (
+        "Use provider-response revision metadata when supplied; otherwise the configured model identifier "
+        "may be a mutable provider-managed alias."
+    )
     pricing_configuration: Dict[str, Any] = Field(default_factory=dict)
     runtime_configuration: Dict[str, Any] = Field(default_factory=dict)
     effective_provider_calls: List[Dict[str, Any]] = Field(default_factory=list)
@@ -43,6 +47,9 @@ class BenchmarkConfigurationSnapshot(BaseSchema):
     dataset_hash: Optional[str] = None
     plan_hash: Optional[str] = None
     compatible: bool = False
+    compatibility_status: str = "INDETERMINATE"
+    compatibility_assessments: Dict[str, Any] = Field(default_factory=dict)
+    compatibility_limitations: List[str] = Field(default_factory=list)
     compatibility_differences: Dict[str, Any] = Field(default_factory=dict)
 
 
@@ -136,6 +143,11 @@ class BenchmarkExperiment(BaseSchema):
     configuration_snapshots: Dict[str, BenchmarkConfigurationSnapshot] = Field(default_factory=dict)
     task_blocks: List[BenchmarkTaskBlock] = Field(default_factory=list)
     schedule_policy: str = "deterministic_williams_4_sequence_cycle"
+    compatibility_policy: str = (
+        "Reject known configuration differences. Provider-unreported immutable revisions and "
+        "provider-default timeout durations are unavailable non-blocking limitations when the "
+        "requested model identifier and timeout mode otherwise match."
+    )
     schedule_sequences_used: List[int] = Field(default_factory=list)
     schedule_cycle_complete: bool = False
     scoring_policy: Dict[str, Any] = Field(default_factory=lambda: {
@@ -150,8 +162,9 @@ class BenchmarkExperiment(BaseSchema):
         "statistical_significance_claimed": False,
     })
     resource_accounting_policy: str = (
-        "AccountingSnapshot is authoritative for token usage; provider-call records are used only "
-        "for request, retry, failure, duration, and dropped-record telemetry."
+        "AccountingSnapshot is authoritative for token usage and total/failed request counters; "
+        "provider-call records provide retry/fallback attribution and per-call configuration/status, "
+        "with dropped-record counts exposing telemetry lower bounds."
     )
     statistical_significance_claimed: bool = False
 
@@ -159,6 +172,8 @@ class BenchmarkExperiment(BaseSchema):
 class BenchmarkEvaluationResult(BaseSchema):
     experiment: BenchmarkExperiment
     aggregate_results: Dict[str, Any] = Field(default_factory=dict)
+    operational_aggregates: Dict[str, Any] = Field(default_factory=dict)
+    comparative_aggregates: Dict[str, Any] = Field(default_factory=dict)
     actual_experiment_cost: Dict[str, Any] = Field(default_factory=dict)
     export_paths: Dict[str, str] = Field(default_factory=dict)
 
