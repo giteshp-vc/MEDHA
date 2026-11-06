@@ -139,6 +139,11 @@ async def run_benchmark_cli(
 ):
     """Run the explicit four-arm benchmark experiment."""
     validate_settings()
+    from config import settings
+
+    if settings.VERIFICATION_MODE != "strict":
+        print("Benchmark requires VERIFICATION_MODE=strict; set it in .env and rerun.")
+        sys.exit(2)
     print("\nStarting MEDHA four-arm benchmark experiment...")
     evaluator = BenchmarkEvaluator()
     result = await evaluator.run_experiment(
@@ -157,6 +162,11 @@ async def run_benchmark_cli(
 
 def main():
     """CLI Entry point with flag parsing."""
+    # Windows consoles default to cp1252, which cannot print many model-generated characters.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
     parser = argparse.ArgumentParser(
         description="MEDHA: Dynamic Multi-Agent Evidence-Driven AI System"
     )

@@ -54,6 +54,32 @@ REVIEWER_SYSTEM_INSTRUCTION = (
     "- UNVERIFIABLE: The claim relies on unknowable external facts or unprovable speculation."
 )
 
+GENERAL_KNOWLEDGE_ADDENDUM = (
+    "\n\nGENERAL KNOWLEDGE MODE (enabled by the operator):\n"
+    "- You MAY ACCEPT a claim without registered evidence ONLY if it states widely established, "
+    "uncontroversial domain knowledge found in standard textbooks or official documentation.\n"
+    "- Such a claim must contain no specific numbers, measurements, dates, citations, URLs, benchmarks, "
+    "or completed-test results, and must not overstate certainty.\n"
+    "- Begin the 'reasoning' of every such acceptance with 'General knowledge (not externally evidenced):'.\n"
+    "- All other rules above still apply; empirical, numeric, recent, or contested claims still require evidence."
+)
+
+
+def _normalize_claim_id(claim_id: str) -> str:
+    """Tolerate cosmetic ID echo drift (case, whitespace, brackets, 'ID:' or 'claim_' prefixes)."""
+    value = str(claim_id or "").strip().strip("[]()<>`'\"").strip().lower()
+    if value.startswith("id:"):
+        value = value[3:].strip()
+    return value.removeprefix("claim_")
+
+
+def reviewer_system_instruction() -> str:
+    from config import settings
+
+    if settings.VERIFICATION_MODE == "general":
+        return REVIEWER_SYSTEM_INSTRUCTION + GENERAL_KNOWLEDGE_ADDENDUM
+    return REVIEWER_SYSTEM_INSTRUCTION
+
 
 class ReviewerAgent(BaseAgent):
     """Adversarial Reviewer Agent dedicated to independent, evidence-grounded claim scrutiny."""
@@ -175,19 +201,27 @@ class ReviewerAgent(BaseAgent):
             batch_out = await self.client.generate_structured(
                 prompt=prompt,
                 response_schema=BatchReviewSchema,
-                system_instruction=REVIEWER_SYSTEM_INSTRUCTION,
+                system_instruction=reviewer_system_instruction(),
                 model=self.model_name,
                 temperature=0.1,
             )
 
             # Validate batch output: check for missing, duplicate, or misassigned claim IDs
+            canonical_ids = {_normalize_claim_id(c.claim_id): c.claim_id for c in claims}
             reviews_by_id: Dict[str, ClaimEvaluationSchema] = {}
             duplicate_ids = set()
+            unmatched_ids: List[str] = []
             for r in batch_out.reviews:
-                if r.claim_id in reviews_by_id:
-                    duplicate_ids.add(r.claim_id)
-                reviews_by_id[r.claim_id] = r
+                matched_id = canonical_ids.get(_normalize_claim_id(r.claim_id))
+                if matched_id is None:
+                    unmatched_ids.append(r.claim_id)
+                    continue
+                if matched_id in reviews_by_id:
+                    duplicate_ids.add(matched_id)
+                reviews_by_id[matched_id] = r
 
+            if unmatched_ids:
+                logger.warning(f"Batch review returned unknown claim IDs (ignored): {unmatched_ids}")
             if duplicate_ids:
                 logger.warning(f"Batch review returned duplicate evaluations for IDs: {duplicate_ids}")
 
@@ -307,7 +341,7 @@ class ReviewerAgent(BaseAgent):
             eval_out = await self.client.generate_structured(
                 prompt=prompt,
                 response_schema=ClaimEvaluationSchema,
-                system_instruction=REVIEWER_SYSTEM_INSTRUCTION,
+                system_instruction=reviewer_system_instruction(),
                 model=self.model_name,
                 temperature=0.1,
             )
@@ -330,7 +364,7 @@ class ReviewerAgent(BaseAgent):
             try:
                 raw_text = await self.client.generate_text(
                     prompt=prompt + "\nReturn ONLY valid JSON.",
-                    system_instruction=REVIEWER_SYSTEM_INSTRUCTION,
+                    system_instruction=reviewer_system_instruction(),
                     model=self.model_name,
                     temperature=0.1,
                 )

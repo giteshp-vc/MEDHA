@@ -120,6 +120,9 @@ class GroqClient(BaseLLMClient):
             "response format",
             "unsupported response format",
             "not supported with this model",
+            # Groq rejects JSON-mode output it cannot validate; plain text is then parsed locally.
+            "json_validate_failed",
+            "failed to validate json",
         ]
         return any(kw in msg for kw in format_keywords)
 
@@ -330,7 +333,7 @@ class GroqClient(BaseLLMClient):
             except Exception as format_err:
                 if self._is_unsupported_format_error(format_err):
                     logger.warning(
-                        "Groq JSON response format is unsupported (%s); retrying without response_format.",
+                        "Groq JSON mode request was rejected (%s); retrying without response_format.",
                         type(format_err).__name__,
                     )
                     response, _ = await request_once(use_json_mode=False)

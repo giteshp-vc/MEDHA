@@ -1,5 +1,6 @@
 import csv
 import json
+import math
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -96,7 +97,7 @@ class BenchmarkEvaluator:
         provider = configuration.get("provider", "unknown")
         model = configuration.get("model", "unknown")
         price = self.pricing.get(f"{provider}:{model}") or self.pricing.get(provider)
-        usage_source = token_usage.get("usage_source", "unknown")
+        usage_source = str(token_usage.get("usage_source", "unknown")).lower()
         if price is None:
             return {
                 "amount_usd": None,
@@ -104,29 +105,52 @@ class BenchmarkEvaluator:
                 "reason": "No provider/model pricing was configured.",
                 "usage_source": usage_source,
             }
-        token_key = "total_tokens" if usage_source == "provider" else "accounted_total_tokens"
-        tokens = token_usage.get(token_key)
-        if tokens is None:
+        rates = (price.get("input_per_million_usd"), price.get("output_per_million_usd"))
+        if any(
+            not isinstance(rate, (int, float))
+            or isinstance(rate, bool)
+            or not math.isfinite(rate)
+            or rate < 0
+            for rate in rates
+        ):
             return {
                 "amount_usd": None,
                 "status": "unknown",
-                "reason": "Token usage was unavailable.",
+                "reason": "Explicit non-negative input and output pricing is incomplete or invalid.",
                 "usage_source": usage_source,
             }
-        input_tokens = token_usage.get("prompt_tokens", 0)
-        output_tokens = token_usage.get("candidate_tokens", 0)
+        if usage_source in {"estimated", "mixed"}:
+            return {
+                "amount_usd": None,
+                "status": usage_source,
+                "reason": "Token usage does not provide a complete provider-reported input/output split.",
+                "usage_source": usage_source,
+            }
+        if usage_source != "provider":
+            return {
+                "amount_usd": None,
+                "status": "unknown",
+                "reason": "Token usage provenance is unknown.",
+                "usage_source": usage_source,
+            }
+        input_tokens = token_usage.get("prompt_tokens")
+        output_tokens = token_usage.get("candidate_tokens")
+        if not all(isinstance(value, int) and not isinstance(value, bool) and value >= 0
+                   for value in (input_tokens, output_tokens)):
+            return {
+                "amount_usd": None,
+                "status": "unknown",
+                "reason": "Provider-reported input/output token usage is unavailable.",
+                "usage_source": usage_source,
+            }
         amount = (
-            input_tokens * price.get("input_per_million_usd", 0.0)
-            + output_tokens * price.get("output_per_million_usd", 0.0)
+            input_tokens * rates[0]
+            + output_tokens * rates[1]
         ) / 1_000_000.0
         return {
             "amount_usd": round(amount, 8),
-            "status": (
-                "actual" if usage_source == "provider"
-                else "mixed" if usage_source == "mixed"
-                else "estimated"
-            ),
-            "reason": "Provider-reported usage." if usage_source == "provider" else "Conservative local estimate.",
+            "status": "actual",
+            "reason": "Explicit provider/model pricing applied to provider-reported usage.",
             "usage_source": usage_source,
         }
 
@@ -456,7 +480,7 @@ class BenchmarkEvaluator:
             writer.writerow(headers)
 
             for r in baseline_results + medha_results:
-                writer.writerow([
+                row = [
                     r.experiment_id,
                     r.trial_id,
                     r.trial_index,
@@ -485,7 +509,8 @@ class BenchmarkEvaluator:
                     r.cost.get("usage_source", "unknown"),
                     r.answer,
                     r.error,
-                ])
+                ]
+                writer.writerow(["null" if value is None else value for value in row])
 
         logger.info(f"Saved benchmark CSV report to {target}")
         return target
@@ -495,6 +520,10 @@ class BenchmarkEvaluator:
         """Generate human-readable side-by-side comparative markdown summary."""
         bm = data["baseline_metrics"]
         mm = data["medha_metrics"]
+        def format_cost(metrics: Dict[str, Any]) -> str:
+            amount = metrics.get("estimated_cost_usd")
+            status = metrics.get("cost_status", "unknown")
+            return f"{status}: ${amount:.4f}" if amount is not None else f"{status}: N/A"
 
         md = [
             "# MEDHA vs Single-Agent Baseline Quantitative Benchmark\n\n",
@@ -509,7 +538,7 @@ class BenchmarkEvaluator:
             f"| **Repair Success Rate** | N/A | {_format_pct(mm['repair_success_rate'])} | Precision Fixes |\n",
             f"| **Average Latency** | {bm['avg_latency_seconds']:.2f}s | {mm['avg_latency_seconds']:.2f}s | {round(mm['avg_latency_seconds'] - bm['avg_latency_seconds'], 2):+0.2f}s |\n",
             f"| **Avg Tokens per Task** | {bm['avg_tokens_per_task']:.0f} | {mm['avg_tokens_per_task']:.0f} | {round(mm['avg_tokens_per_task'] - bm['avg_tokens_per_task'], 0):+0.0f} |\n",
-            f"| **Cost (USD)** | {bm.get('cost_status', 'unknown')}: ${bm['estimated_cost_usd']:.4f} | {mm.get('cost_status', 'unknown')}: ${mm['estimated_cost_usd']:.4f} | Not a significance test |\n",
+            f"| **Cost (USD)** | {format_cost(bm)} | {format_cost(mm)} | Not a significance test |\n",
             f"| **Latency Variance** | {bm.get('latency_variance_seconds', 'N/A')} | {mm.get('latency_variance_seconds', 'N/A')} | Descriptive only |\n",
             f"| **Failed Trials** | {bm.get('failure_count', 0)} | {mm.get('failure_count', 0)} | Preserved in trial records |\n",
         ]

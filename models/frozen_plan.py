@@ -31,7 +31,7 @@ class FrozenTaskPlan(BaseSchema):
         return cls(
             source_task=source_task,
             serialized_plan=serialized_plan,
-            plan_hash=hashlib.sha256(serialized_plan.encode("utf-8")).hexdigest(),
+            plan_hash=_plan_hash(source_task, serialized_plan),
             preparation_accounting=preparation_accounting,
         )
 
@@ -39,7 +39,7 @@ class FrozenTaskPlan(BaseSchema):
         """Verify task binding and artifact integrity, then return a fresh mutable plan copy."""
         if expected_task != self.source_task:
             raise ValueError("Frozen task plan belongs to a different source task.")
-        actual_hash = hashlib.sha256(self.serialized_plan.encode("utf-8")).hexdigest()
+        actual_hash = _plan_hash(self.source_task, self.serialized_plan)
         if actual_hash != self.plan_hash:
             raise ValueError("Frozen task plan hash does not match its serialized contents.")
 
@@ -67,6 +67,11 @@ def validate_task_plan(plan: TaskPlan, source_task: str) -> None:
             raise ValueError(f"Subtask [{subtask.id}] must have a non-empty role.")
         if not subtask.objective or not subtask.objective.strip():
             raise ValueError(f"Subtask [{subtask.id}] must have a non-empty objective.")
+        if str(getattr(subtask.status, "value", subtask.status)) != "PENDING":
+            raise ValueError(
+                f"Subtask [{subtask.id}] has execution state [{subtask.status}]; "
+                "frozen plans require every subtask to be PENDING."
+            )
         if len(subtask.dependencies) != len(set(subtask.dependencies)):
             raise ValueError(f"Subtask [{subtask.id}] contains duplicate dependency IDs.")
         subtask_ids.append(subtask.id)
@@ -107,3 +112,13 @@ def _serialize_plan(plan: TaskPlan) -> str:
         sort_keys=True,
         separators=(",", ":"),
     )
+
+
+def _plan_hash(source_task: str, serialized_plan: str) -> str:
+    hash_material = json.dumps(
+        {"source_task": source_task, "serialized_plan": serialized_plan},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(hash_material.encode("utf-8")).hexdigest()

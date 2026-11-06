@@ -51,6 +51,9 @@ CLAIM_EXTRACTION_TOKEN_RESERVE = int(os.getenv("CLAIM_EXTRACTION_TOKEN_RESERVE",
 VERIFICATION_TOKEN_RESERVE = int(os.getenv("VERIFICATION_TOKEN_RESERVE", "12288"))
 SYNTHESIS_TOKEN_RESERVE = int(os.getenv("SYNTHESIS_TOKEN_RESERVE", "4096"))
 
+# 'strict' requires registered evidence; 'general' also accepts well-established textbook knowledge.
+VERIFICATION_MODE = os.getenv("VERIFICATION_MODE", "strict").strip().lower()
+
 # MCP background execution
 MCP_MAX_ACTIVE_JOBS = int(os.getenv("MCP_MAX_ACTIVE_JOBS", "20"))
 MCP_MAX_RECORDS = int(os.getenv("MCP_MAX_RECORDS", "100"))
@@ -75,6 +78,9 @@ LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
 def validate_settings() -> bool:
     """Validate essential MEDHA configuration based on the active provider."""
+    if VERIFICATION_MODE not in ("strict", "general"):
+        raise ValueError("VERIFICATION_MODE must be 'strict' or 'general'.")
+
     provider = (LLM_PROVIDER or "").lower().strip()
     if provider not in ("groq", "gemini"):
         raise ValueError(

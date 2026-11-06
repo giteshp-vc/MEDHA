@@ -745,6 +745,8 @@ class DeliberationCoordinator:
             f"Exchange ID: {trigger.exchange_id}\n"
             f"Correlation ID: {trigger.correlation_id}\n"
             f"Reply to message ID: {request.message_id}\n"
+            f"Your agent ID (use as sender_agent_id): {trigger.target_agent_id}\n"
+            f"Requesting agent ID (use as recipient_agent_id): {trigger.source_agent_id}\n"
             f"Trigger: {_enum_value(trigger.trigger_type)}\n"
             f"Claim reference: {trigger.claim_reference or 'none'}\n"
             f"Evidence references: {', '.join(evidence) or 'none'}\n"

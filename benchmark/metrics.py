@@ -78,7 +78,10 @@ class SystemMetrics(BaseSchema):
     reviewer_rejection_rate: float = 0.0
     repair_success_rate: float = 0.0
     reference_criteria_coverage: float = 0.0
-    estimated_cost_usd: float = 0.0
+    estimated_cost_usd: Optional[float] = None
+    known_cost_subtotal_usd: Optional[float] = None
+    unknown_cost_count: int = 0
+    cost_provenance_counts: Dict[str, int] = Field(default_factory=dict)
     cost_status: str = "unknown"
     failure_count: int = 0
     latency_variance_seconds: Optional[float] = None
@@ -150,20 +153,23 @@ def compute_system_metrics(
     )
     rejection_rate = round(sum(all_rejections) / total_claims, 3) if total_claims > 0 else 0.0
 
-    cost_values = [
-        result.cost.get("amount_usd")
-        for result in results
-        if result.cost.get("amount_usd") is not None
-        and result.cost.get("status") in ("actual", "estimated", "mixed")
-    ]
-    cost_statuses = {result.cost.get("status") for result in results if result.cost.get("status")}
+    cost_values = []
+    cost_provenance_counts: Dict[str, int] = {}
+    for result in results:
+        status = str(result.cost.get("status", "unknown"))
+        cost_provenance_counts[status] = cost_provenance_counts.get(status, 0) + 1
+        amount = result.cost.get("amount_usd")
+        if amount is not None and status in ("actual", "estimated", "mixed"):
+            cost_values.append(float(amount))
+    unknown_cost_count = total - len(cost_values)
     cost_status = (
-        "actual" if cost_statuses == {"actual"}
-        else "estimated" if cost_statuses and cost_statuses <= {"actual", "estimated"}
-        else "mixed" if "mixed" in cost_statuses
+        "actual" if cost_provenance_counts == {"actual": total} and unknown_cost_count == 0
+        else "estimated" if cost_provenance_counts == {"estimated": total} and unknown_cost_count == 0
+        else "mixed" if cost_provenance_counts and set(cost_provenance_counts) <= {"actual", "estimated", "mixed"} and unknown_cost_count == 0
         else "unknown"
     )
-    total_cost = round(sum(cost_values), 5) if cost_values else 0.0
+    known_cost_subtotal = round(sum(cost_values), 5) if cost_values else None
+    total_cost = known_cost_subtotal if unknown_cost_count == 0 else None
 
     metric_names = {name for result in results for name in result.answer_metrics}
     answer_metrics: Dict[str, Optional[float]] = {}
@@ -199,6 +205,9 @@ def compute_system_metrics(
         repair_success_rate=avg_repair_success,
         reference_criteria_coverage=avg_coverage,
         estimated_cost_usd=total_cost,
+        known_cost_subtotal_usd=known_cost_subtotal,
+        unknown_cost_count=unknown_cost_count,
+        cost_provenance_counts=cost_provenance_counts,
         cost_status=cost_status,
         failure_count=failed,
         latency_variance_seconds=latency_variance,

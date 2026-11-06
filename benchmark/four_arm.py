@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import csv
+from collections import Counter
 import importlib.metadata
 import inspect
 import json
@@ -52,7 +53,10 @@ _CSV_FIELDS = (
     "quality_eligible", "start_timestamp", "end_timestamp", "duration_seconds", "error_category",
     "answer_completeness", "task_completion", "pitfall_avoidance", "uncertainty_handling",
     "evidence_quality", "factual_correctness", "verification_support_rate",
-    "verification_unsupported_rate", "answer_completeness_eligible_count",
+    "verification_unsupported_rate", "verification_reviewed_claim_count",
+    "verification_accepted_claims_count", "verification_rejected_claims_count",
+    "verification_needs_revision_claims_count", "verification_unverifiable_claims_count",
+    "verification_unreviewed_claims_count", "answer_completeness_eligible_count",
     "answer_completeness_missing_count", "task_completion_eligible_count",
     "task_completion_missing_count", "pitfall_avoidance_eligible_count",
     "pitfall_avoidance_missing_count", "uncertainty_handling_eligible_count",
@@ -62,9 +66,18 @@ _CSV_FIELDS = (
     "verification_missing_count", "metric_attempt_count", "metric_missing_count",
     "input_tokens", "output_tokens", "total_tokens", "provider_reported_total_tokens",
     "estimated_total_tokens", "usage_source",
-    "provider_request_count", "retry_count", "provider_failure_count", "telemetry_complete",
-    "dropped_provider_call_records", "plan_preparation_cost_usd", "trial_execution_cost_usd",
-    "end_to_end_cost_usd", "cost_provenance", "configuration_compatible", "answer",
+    "provider_request_count", "failed_provider_request_count", "retry_count",
+        "provider_failure_count", "fallback_request_count", "provider_timeout_count",
+        "provider_timeout_count_is_lower_bound", "timed_out_count",
+        "retry_counts_are_lower_bounds", "fallback_counts_are_lower_bounds",
+        "provider_failure_count_is_lower_bound", "provider_request_count_source",
+        "failed_provider_request_count_source", "provider_request_count_is_lower_bound",
+        "failed_provider_request_count_is_lower_bound",
+        "usage_complete", "usage_completeness", "compatibility_status", "compatibility_limitations",
+    "compatibility_exclusion_reason", "metric_eligibility", "metric_missingness_reasons",
+    "telemetry_complete", "dropped_provider_call_records", "plan_preparation_cost_usd",
+    "trial_execution_cost_usd", "end_to_end_cost_usd", "cost_provenance",
+    "configuration_compatible", "answer",
 )
 
 
@@ -164,18 +177,36 @@ def _cost_for(
 
 def _sum_costs(costs: Iterable[dict[str, Any]], *, shared_once: bool = False) -> dict[str, Any]:
     selected = list(costs)
+    provenance_counts = dict(Counter(
+        str(cost.get("status", "unknown")) for cost in selected
+    ))
+    known_amounts = [
+        float(cost["amount_usd"])
+        for cost in selected
+        if cost.get("amount_usd") is not None
+    ]
+    unknown_count = len(selected) - len(known_amounts)
+    known_subtotal = round(sum(known_amounts), 10) if known_amounts else None
     unknown = [cost for cost in selected if cost.get("amount_usd") is None]
     if unknown:
         return {
             "amount_usd": None,
             "status": "unknown",
+            "known_subtotal_usd": known_subtotal,
+            "known_cost_count": len(known_amounts),
+            "unknown_cost_count": unknown_count,
+            "provenance_counts": provenance_counts,
             "reason": "At least one component cost is unknown.",
             "shared_preparation_counted_once": shared_once,
         }
-    statuses = {str(cost.get("status", "unknown")) for cost in selected}
+    statuses = set(provenance_counts)
     status = next(iter(statuses)) if len(statuses) == 1 else "mixed" if statuses else "unknown"
     return {
-        "amount_usd": round(sum(float(cost["amount_usd"]) for cost in selected), 10),
+        "amount_usd": known_subtotal,
+        "known_subtotal_usd": known_subtotal,
+        "known_cost_count": len(known_amounts),
+        "unknown_cost_count": 0,
+        "provenance_counts": provenance_counts,
         "status": status,
         "reason": "Sum of explicitly priced accounting snapshots.",
         "shared_preparation_counted_once": shared_once,
@@ -491,8 +522,17 @@ class FourArmBenchmark:
     ) -> None:
         profile_fields = (
             "provider", "model", "temperature", "input_token_limit", "output_token_limit",
+            "timeout_source", "timeout_seconds",
         )
-        profiles: dict[str, list[dict[str, Any]]] = {}
+        known_stages = {
+            "baseline", "planning", "specialist_execution", "claim_extraction",
+            "verification", "repair", "synthesis", "deliberation",
+        }
+        planned_arms = (
+            BenchmarkArm.INDEPENDENT_PARALLEL.value,
+            BenchmarkArm.DEPENDENCY_AWARE.value,
+            BenchmarkArm.FULL_MEDHA.value,
+        )
         differences = dict(initial_differences)
         assessments = dict(
             experiment.configuration_snapshots["BASELINE"].compatibility_assessments
@@ -500,247 +540,272 @@ class FourArmBenchmark:
         limitations = list(
             experiment.configuration_snapshots["BASELINE"].compatibility_limitations
         )
-        profiles_by_stage: dict[str, dict[str, list[dict[str, Any]]]] = {}
-        revisions_by_stage: dict[str, dict[str, set[str]]] = {}
-        response_models_by_stage: dict[str, dict[str, set[str]]] = {}
-        provider_call_coverage: dict[str, int] = {}
+        profiles: dict[str, list[dict[str, Any]]] = {arm.value: [] for arm in BenchmarkArm}
+        profiles_by_stage: dict[str, dict[str, dict[str, dict[str, Any]]]] = {}
+        revisions: set[str] = set()
+        response_models: set[str] = set()
+        provider_call_observation_count = 0
         revision_observation_count = 0
         response_model_observation_count = 0
-        declared_fields = {
-            "provider": "provider",
-            "model": "model",
-            "model_version": "model_version",
-            "temperature": "temperature",
-            "input_token_limit": "input_token_limit",
-            "output_token_limit": "output_token_limit",
-        }
+        blocking_unavailable = False
+        dropped_by_arm = {arm.value: 0 for arm in BenchmarkArm}
+
+        def make_profile(call: ProviderCallRecord) -> dict[str, Any]:
+            profile = {
+                "provider": call.provider,
+                "model": call.model,
+                "temperature": call.temperature,
+                "input_token_limit": call.input_token_limit,
+                "output_token_limit": call.output_token_limit,
+                "timeout_source": call.timeout_source or "unavailable",
+            }
+            if profile["timeout_source"] == "explicit_request":
+                profile["timeout_seconds"] = call.timeout_seconds
+            return profile
+
+        def record_call(arm_name: str, call: ProviderCallRecord, *, planner: bool = False) -> None:
+            nonlocal blocking_unavailable
+            nonlocal provider_call_observation_count
+            nonlocal revision_observation_count
+            nonlocal response_model_observation_count
+            provider_call_observation_count += 1
+            stage = str(call.stage or "").strip().casefold()
+            assessment_prefix = "planner" if planner else arm_name
+            if not stage or stage not in known_stages:
+                assessments[f"{assessment_prefix}.provider_call_stage"] = {
+                    "status": "unavailable",
+                    "stage": call.stage,
+                }
+                limitations.append(f"{assessment_prefix} provider-call stage metadata is missing or unknown.")
+                blocking_unavailable = True
+                return
+
+            profile = make_profile(call)
+            profile["stage"] = stage
+            if not planner:
+                profiles_by_stage.setdefault(stage, {}).setdefault(arm_name, {})[
+                    canonical_hash(profile)
+                ] = profile
+                profiles[arm_name].append(profile)
+
+            declared = experiment.configuration_snapshots[
+                BenchmarkArm.BASELINE.value if arm_name == BenchmarkArm.BASELINE.value else
+                BenchmarkArm.FULL_MEDHA.value
+            ].provider_configuration
+            required_fields = ("provider", "model", "input_token_limit")
+            missing_fields = []
+            for name in required_fields:
+                configured = declared.get(name)
+                effective = getattr(call, name)
+                if configured in (None, "", "unknown") or effective in (None, "", "unknown"):
+                    missing_fields.append(name)
+                elif configured != effective:
+                    differences[f"{assessment_prefix}.{stage}.{name}"] = {
+                        "configured": configured,
+                        "effective": effective,
+                    }
+            configured_output = declared.get("output_token_limit")
+            if call.output_token_limit is None or configured_output in (None, "", "unknown"):
+                missing_fields.append("output_token_limit")
+            elif call.output_token_limit > configured_output:
+                differences[f"{assessment_prefix}.{stage}.output_token_limit"] = {
+                    "configured_maximum": configured_output,
+                    "effective": call.output_token_limit,
+                }
+            if call.temperature is None:
+                missing_fields.append("temperature")
+            if profile["timeout_source"] == "unavailable":
+                missing_fields.append("timeout_source")
+            elif profile["timeout_source"] == "explicit_request" and call.timeout_seconds is None:
+                missing_fields.append("timeout_seconds")
+            elif profile["timeout_source"] == "provider_sdk_default":
+                limitations.append(f"{assessment_prefix}.{stage} uses an SDK-default timeout duration.")
+
+            if missing_fields:
+                assessments[f"{assessment_prefix}.{stage}.effective_configuration"] = {
+                    "status": "unavailable",
+                    "fields": sorted(set(missing_fields)),
+                }
+                limitations.append(f"{assessment_prefix}.{stage} effective configuration is incomplete.")
+                blocking_unavailable = True
+            elif not any(key.startswith(f"{assessment_prefix}.{stage}.") for key in differences):
+                assessments[f"{assessment_prefix}.{stage}.effective_configuration"] = {
+                    "status": "known",
+                }
+
+            if call.model_version_source == "provider_response" and call.model_version:
+                revisions.add(call.model_version)
+                revision_observation_count += 1
+            else:
+                limitations.append(f"{assessment_prefix}.{stage} provider revision is unavailable.")
+            if call.response_model:
+                response_models.add(call.response_model)
+                response_model_observation_count += 1
+
         for arm in BenchmarkArm:
-            calls = [
-                call
+            arm_name = arm.value
+            arm_trials = [
+                trial.result
                 for block in experiment.task_blocks
                 for trial in block.trials
-                if trial.arm_id == arm.value
-                for call in trial.result.provider_call_records
+                if trial.arm_id == arm_name
             ]
-            normalized_profiles = []
-            for call in calls:
-                profile = {name: getattr(call, name) for name in profile_fields}
-                timeout_source = getattr(call, "timeout_source", None)
-                profile["timeout_source"] = timeout_source or "unavailable"
-                if timeout_source == "explicit_request":
-                    profile["timeout_seconds"] = call.timeout_seconds
-                normalized_profiles.append(profile)
-            unique = {
-                canonical_hash(profile): profile
-                for profile in normalized_profiles
-            }
-            profiles[arm.value] = [unique[key] for key in sorted(unique)]
-            provider_call_coverage[arm.value] = len(calls)
-            for call in calls:
-                declared = experiment.configuration_snapshots[arm.value].provider_configuration
-                for call_field, config_field in declared_fields.items():
-                    if call_field == "output_token_limit":
-                        continue
-                    configured = declared.get(config_field)
-                    effective = getattr(call, call_field)
-                    assessment_key = f"{arm.value}.effective_call.{config_field}"
-                    if configured in (None, "", "unknown") or effective in (None, "", "unknown"):
-                        assessments[assessment_key] = {
-                            "status": "unavailable",
-                            "configured": configured,
-                            "effective": effective,
-                        }
-                        limitations.append(f"{arm.value} effective {config_field} metadata is unavailable.")
-                    elif effective != configured:
-                        assessments[assessment_key] = {
-                            "status": "known_different",
-                            "configured": configured,
-                            "effective": effective,
-                        }
-                        differences[f"{arm.value}.effective_call.{config_field}"] = {
-                            "configured": configured,
-                            "effective": effective,
-                        }
-                    else:
-                        assessments[assessment_key] = {
-                            "status": "known_equal",
-                            "value": effective,
-                        }
-                configured_output_limit = declared.get("output_token_limit")
-                if (
-                    configured_output_limit not in (None, "", "unknown")
-                    and call.output_token_limit is not None
-                    and call.output_token_limit > configured_output_limit
-                ):
-                    assessments[f"{arm.value}.effective_call.output_token_limit"] = {
-                        "status": "known_different",
-                        "configured_maximum": configured_output_limit,
-                        "effective": call.output_token_limit,
+            if not arm_trials:
+                assessments[f"{arm_name}.effective_provider_calls"] = {"status": "unavailable"}
+                limitations.append(f"{arm_name} has no provider-call records to verify effective configuration.")
+                blocking_unavailable = True
+            for result in arm_trials:
+                if result.accounting is None:
+                    assessments[f"{arm_name}.effective_provider_calls"] = {
+                        "status": "unavailable",
+                        "reason": "accounting snapshot/drop counter unavailable",
                     }
-                    differences[f"{arm.value}.effective_call.output_token_limit"] = {
-                        "configured_maximum": configured_output_limit,
-                        "effective": call.output_token_limit,
-                    }
-                elif call.output_token_limit is not None:
-                    assessments[f"{arm.value}.effective_call.output_token_limit"] = {
-                        "status": "known_equal",
-                        "comparison": "effective value is within the configured maximum",
-                        "configured_maximum": configured_output_limit,
-                        "effective": call.output_token_limit,
-                    }
-                profile = {name: getattr(call, name) for name in profile_fields}
-                profile["timeout_source"] = getattr(call, "timeout_source", None) or "unavailable"
-                if profile["timeout_source"] == "explicit_request":
-                    profile["timeout_seconds"] = call.timeout_seconds
-                profile_hash = canonical_hash(profile)
-                profiles_by_stage.setdefault(str(call.stage or "unknown"), {}).setdefault(arm.value, {})[
-                    profile_hash
-                ] = profile
-                stage = str(call.stage or "unknown")
-                if getattr(call, "model_version_source", "unavailable") == "provider_response" and call.model_version:
-                    revisions_by_stage.setdefault(stage, {}).setdefault(arm.value, set()).add(call.model_version)
-                    revision_observation_count += 1
-                if call.response_model:
-                    response_models_by_stage.setdefault(stage, {}).setdefault(arm.value, set()).add(call.response_model)
-                    response_model_observation_count += 1
-                if getattr(call, "timeout_source", None) == "provider_sdk_default":
                     limitations.append(
-                        "Provider SDK default request-timeout duration is unavailable."
+                        f"{arm_name} provider-call completeness cannot be verified without an accounting snapshot."
                     )
-                elif getattr(call, "timeout_source", None) not in ("explicit_request", "provider_sdk_default"):
-                    limitations.append("Effective request-timeout mode is unavailable for one or more calls.")
-                if getattr(call, "model_version_source", "unavailable") != "provider_response" or not call.model_version:
-                    limitations.append(
-                        "Provider response did not expose an immutable model revision for one or more calls."
-                    )
-            missing = [name for item in profiles[arm.value] for name in profile_fields
-                       if item.get(name) in (None, "", "unknown")]
-            if not profiles[arm.value]:
-                limitations.append(f"{arm.value} has no provider-call records to verify effective configuration.")
-                assessments[f"{arm.value}.effective_provider_calls"] = {"status": "unavailable"}
-            elif missing:
-                assessments[f"{arm.value}.effective_provider_calls"] = {
+                    blocking_unavailable = True
+                accounting_dropped = (
+                    result.accounting.dropped_provider_call_records
+                    if result.accounting is not None
+                    else 0
+                )
+                dropped = max(result.dropped_provider_call_records, accounting_dropped)
+                dropped_by_arm[arm_name] += dropped
+                for call in result.provider_call_records:
+                    record_call(arm_name, call)
+            if arm_trials and not any(result.provider_call_records for result in arm_trials):
+                assessments[f"{arm_name}.effective_provider_calls"] = {"status": "unavailable"}
+                limitations.append(f"{arm_name} has no retained provider-call records for effective configuration.")
+                blocking_unavailable = True
+            if dropped_by_arm[arm_name]:
+                assessments[f"{arm_name}.effective_provider_calls"] = {
                     "status": "unavailable",
-                    "reason": "required effective call fields unknown",
-                    "fields": sorted(set(missing)),
+                    "reason": "provider-call records were dropped",
+                    "dropped_record_count": dropped_by_arm[arm_name],
                 }
-                limitations.append(f"{arm.value} effective provider-call settings are partially unavailable.")
-            else:
-                assessments[f"{arm.value}.effective_provider_calls"] = {"status": "known"}
-        planned_arms = {
-            BenchmarkArm.INDEPENDENT_PARALLEL.value,
-            BenchmarkArm.DEPENDENCY_AWARE.value,
-            BenchmarkArm.FULL_MEDHA.value,
-        }
-        stage_differences = {}
-        for stage, arms in profiles_by_stage.items():
-            if not planned_arms.issubset(arms):
-                continue
-            arm_profiles = {
-                arm: sorted(arms[arm].values(), key=canonical_hash)
-                for arm in sorted(planned_arms)
-            }
-            if len({canonical_hash(value) for value in arm_profiles.values()}) != 1:
-                stage_differences[stage] = arm_profiles
-        if stage_differences:
-            differences["shared_stage_provider_call_profiles"] = stage_differences
+                limitations.append(
+                    f"{arm_name} effective configuration is incomplete because provider-call records were dropped."
+                )
+                blocking_unavailable = True
 
-        for metadata_name, profiles_for_metadata, observation_count in (
-            ("provider_model_revision", revisions_by_stage, revision_observation_count),
-            ("provider_response_model", response_models_by_stage, response_model_observation_count),
-        ):
-            observed = [
-                value
-                for stage_profiles in profiles_for_metadata.values()
-                for arm_values in stage_profiles.values()
-                for value in arm_values
-            ]
-            if observed and len(set(observed)) > 1:
-                differences[metadata_name] = sorted(set(observed))
-                assessments[metadata_name] = {"status": "known_different", "values": sorted(set(observed))}
-            elif observed and observation_count == sum(provider_call_coverage.values()):
-                assessments[metadata_name] = {"status": "known_equal", "value": observed[0]}
-            else:
-                assessments[metadata_name] = {"status": "unavailable", "non_blocking": True}
-                limitations.append(f"{metadata_name} was not provider-reported for every observed call.")
-
-        timeout_sources_by_arm = {
-            arm: {profile.get("timeout_source") for profile in arm_profiles}
-            for arm, arm_profiles in profiles.items()
-        }
-        timeout_sources = set().union(*timeout_sources_by_arm.values()) if timeout_sources_by_arm else set()
-        all_arms_have_timeout_observations = all(
-            provider_call_coverage.get(arm, 0) > 0
-            and len(timeout_sources_by_arm.get(arm, set())) == 1
-            for arm in (candidate.value for candidate in BenchmarkArm)
-        )
-        if len(timeout_sources) > 1:
-            differences["effective_request_timeout_mode"] = sorted(timeout_sources)
-            assessments["request_timeout_mode"] = {
-                "status": "known_different",
-                "values": sorted(timeout_sources),
-            }
-        elif timeout_sources == {"explicit_request"} and all_arms_have_timeout_observations:
-            explicit_values = {
-                profile.get("timeout_seconds")
-                for arm_profiles in profiles.values()
-                for profile in arm_profiles
-            }
-            if len(explicit_values) > 1:
-                differences["effective_request_timeout_seconds"] = sorted(explicit_values, key=str)
-                assessments["request_timeout_seconds"] = {
-                    "status": "known_different",
-                    "values": sorted(explicit_values, key=str),
-                }
-            else:
-                assessments["request_timeout_seconds"] = {
-                    "status": "known_equal",
-                    "value": next(iter(explicit_values), None),
-                }
-        elif timeout_sources == {"provider_sdk_default"} and all_arms_have_timeout_observations:
-            assessments["request_timeout_mode"] = {"status": "known_equal", "value": "provider_sdk_default"}
-            assessments["request_timeout_seconds"] = {"status": "unavailable", "non_blocking": True}
-        elif not timeout_sources:
-            assessments["request_timeout_seconds"] = {"status": "unavailable", "non_blocking": True}
-            limitations.append("No effective request-timeout observations were recorded.")
-        else:
-            assessments["request_timeout_seconds"] = {"status": "unavailable", "non_blocking": True}
-            limitations.append("Request timeout duration could not be established for every provider call.")
-
-        planner_calls = [
-            call.model_dump(mode="json")
+        planner_snapshots = [
+            block.plan_preparation_accounting
             for block in experiment.task_blocks
             if block.plan_preparation_accounting is not None
-            for call in block.plan_preparation_accounting.provider_calls
         ]
+        planner_calls = []
+        planner_dropped = 0
+        for snapshot in planner_snapshots:
+            planner_dropped += snapshot.dropped_provider_call_records
+            planner_calls.extend(snapshot.provider_calls)
         if not planner_calls:
-            limitations.append("Planner effective provider-call settings are unavailable.")
-            assessments["planner.effective_provider_calls"] = {"status": "unavailable"}
-        else:
-            missing_planner_fields = sorted({
-                name
-                for call in planner_calls
-                for name in profile_fields
-                if call.get(name) in (None, "", "unknown")
-            })
-            if missing_planner_fields:
-                assessments["planner.effective_provider_calls"] = {
-                    "status": "unavailable",
-                    "reason": "required effective call fields unknown",
-                    "fields": missing_planner_fields,
-                }
-                limitations.append("Planner effective provider-call settings are partially unavailable.")
+            if planner_snapshots:
+                assessments["planner.effective_provider_calls"] = {"status": "not_applicable"}
+                limitations.append("Planning accounting snapshots contain no provider-call records.")
             else:
-                assessments["planner.effective_provider_calls"] = {"status": "known"}
-            if any(call.get("model_version_source") != "provider_response" or not call.get("model_version") for call in planner_calls):
-                limitations.append("Planner provider response did not expose an immutable model revision.")
-            if any(call.get("timeout_source") == "provider_sdk_default" for call in planner_calls):
-                limitations.append("Planner request timeout duration is provider-managed and unavailable.")
+                assessments["planner.effective_provider_calls"] = {"status": "unavailable"}
+                limitations.append("Planner accounting snapshots are unavailable.")
+                blocking_unavailable = True
+        else:
+            for call in planner_calls:
+                record_call(BenchmarkArm.FULL_MEDHA.value, call, planner=True)
+            assessments["planner.effective_provider_calls"] = {
+                "status": "unavailable" if planner_dropped else "known",
+                "dropped_record_count": planner_dropped,
+            }
+        if planner_dropped:
+            limitations.append("Planner provider-call records were dropped; planning telemetry is incomplete.")
+            blocking_unavailable = True
 
-        compatible = not differences
+        stage_differences = {}
+        common_stage_assessments = {}
+        observed_stages = set(profiles_by_stage)
+        for stage in sorted(observed_stages):
+            stage_arms = profiles_by_stage.get(stage, {})
+            participating = [arm for arm in planned_arms if arm in stage_arms]
+            if stage == "deliberation" and participating == [BenchmarkArm.FULL_MEDHA.value]:
+                common_stage_assessments[stage] = {
+                    "status": "treatment_specific",
+                    BenchmarkArm.INDEPENDENT_PARALLEL.value: "not_applicable",
+                    BenchmarkArm.DEPENDENCY_AWARE.value: "not_applicable",
+                    BenchmarkArm.FULL_MEDHA.value: sorted(stage_arms[BenchmarkArm.FULL_MEDHA.value].values(), key=canonical_hash),
+                }
+                assessments[f"stage.{stage}"] = common_stage_assessments[stage]
+                continue
+            if not participating:
+                common_stage_assessments[stage] = {
+                    "status": "not_applicable",
+                    "observed_arms": participating,
+                }
+                assessments[f"stage.{stage}"] = common_stage_assessments[stage]
+                continue
+            stage_profiles = {
+                arm: sorted(stage_arms[arm].values(), key=canonical_hash)
+                for arm in participating
+            }
+            if len(participating) != len(planned_arms):
+                common_stage_assessments[stage] = {
+                    "status": "unavailable",
+                    "observed_arms": participating,
+                    "profiles": stage_profiles,
+                }
+                limitations.append(f"Stage {stage} was not observed in every planned arm.")
+                blocking_unavailable = True
+            elif len({canonical_hash(profiles_for_arm) for profiles_for_arm in stage_profiles.values()}) > 1:
+                common_stage_assessments[stage] = {
+                    "status": "known_different",
+                    "profiles": stage_profiles,
+                }
+                stage_differences[stage] = stage_profiles
+            else:
+                common_stage_assessments[stage] = {
+                    "status": "known_equal",
+                    "profiles": stage_profiles,
+                }
+            assessments[f"stage.{stage}"] = common_stage_assessments[stage]
+
+        if stage_differences:
+            differences["shared_stage_provider_call_profiles"] = stage_differences
+        if len(revisions) > 1:
+            differences["provider_model_revision"] = sorted(revisions)
+            assessments["provider_model_revision"] = {
+                "status": "known_different",
+                "values": sorted(revisions),
+            }
+        elif revisions and revision_observation_count == provider_call_observation_count and not any(dropped_by_arm.values()) and not planner_dropped:
+            assessments["provider_model_revision"] = {
+                "status": "known_equal",
+                "value": next(iter(revisions)),
+            }
+        else:
+            assessments["provider_model_revision"] = {
+                "status": "unavailable",
+                "value": next(iter(revisions), None),
+                "non_blocking": True,
+            }
+        if len(response_models) > 1:
+            differences["provider_response_model"] = sorted(response_models)
+            assessments["provider_response_model"] = {
+                "status": "known_different",
+                "values": sorted(response_models),
+            }
+        elif response_models and response_model_observation_count == provider_call_observation_count and not any(dropped_by_arm.values()) and not planner_dropped:
+            assessments["provider_response_model"] = {
+                "status": "known_equal",
+                "value": next(iter(response_models)),
+            }
+        else:
+            assessments["provider_response_model"] = {
+                "status": "unavailable",
+                "value": next(iter(response_models), None),
+                "non_blocking": True,
+            }
+
         limitations = list(dict.fromkeys(limitations))
+        compatible = not differences and not blocking_unavailable
         compatibility_status = (
             "INCOMPATIBLE" if differences
+            else "INDETERMINATE" if blocking_unavailable
             else "COMPATIBLE_WITH_LIMITATIONS" if limitations
             else "COMPATIBLE"
         )
@@ -753,7 +818,9 @@ class FourArmBenchmark:
                 "compatibility_limitations": limitations,
                 "planner_configuration": {
                     **current.planner_configuration,
-                    "effective_provider_calls": planner_calls if arm is not BenchmarkArm.BASELINE else [],
+                    "effective_provider_calls": [
+                        call.model_dump(mode="json") for call in planner_calls
+                    ] if arm is not BenchmarkArm.BASELINE else [],
                 },
                 "compatible": compatible,
                 "compatibility_differences": differences,
@@ -877,6 +944,42 @@ class FourArmBenchmark:
     def _snapshot_cost(self, snapshot: AccountingSnapshot, configuration: dict[str, Any]) -> dict[str, Any]:
         return _cost_for(snapshot.token_usage, configuration, self.evaluator.pricing)
 
+    @staticmethod
+    def _provider_request_counts(
+        accounting: Optional[AccountingSnapshot],
+        provider_calls: list[ProviderCallRecord],
+        dropped_records: int = 0,
+    ) -> dict[str, Any]:
+        usage = accounting.token_usage if accounting is not None else {}
+        dropped = max(
+            dropped_records,
+            accounting.dropped_provider_call_records if accounting is not None else 0,
+        )
+
+        def count(name: str, record_value: int) -> tuple[Optional[int], str, bool]:
+            snapshot_value = usage.get(name)
+            if snapshot_value is not None:
+                return int(snapshot_value), "accounting_snapshot", False
+            if provider_calls:
+                return int(record_value), "provider_call_records", bool(dropped or accounting is None)
+            return None, "unavailable", False
+
+        requests, request_source, requests_lower_bound = count(
+            "total_requests", len(provider_calls)
+        )
+        failures, failure_source, failures_lower_bound = count(
+            "failed_requests",
+            sum(str(call.status).upper() != "SUCCEEDED" for call in provider_calls),
+        )
+        return {
+            "total_requests": requests,
+            "failed_requests": failures,
+            "request_count_source": request_source,
+            "failure_count_source": failure_source,
+            "request_count_is_lower_bound": requests_lower_bound,
+            "failure_count_is_lower_bound": failures_lower_bound,
+        }
+
     async def _run_trial(
         self,
         *,
@@ -929,10 +1032,17 @@ class FourArmBenchmark:
         if arm is BenchmarkArm.BASELINE and result_value is not None:
             success_flag = _read_attr(result_value, "success", bool(answer.strip())) is True
             reported_error = _read_attr(result_value, "error")
-            status = "SUCCESS" if success_flag and not reported_error and answer.strip() else "FAILED"
+            if success_flag and not reported_error and answer.strip():
+                status = "SUCCESS"
+            elif isinstance(reported_error, str) and "timeout" in reported_error.casefold():
+                status = "TIMED_OUT"
+            else:
+                status = "FAILED"
         else:
             status = str(getattr(status_value, "value", status_value) or "FAILED").upper()
-            if status not in {"SUCCESS", "PARTIAL_FAILURE", "FAILED", "CANCELLED", "INTERRUPTED"}:
+            if status not in {
+                "SUCCESS", "PARTIAL_FAILURE", "FAILED", "TIMED_OUT", "CANCELLED", "INTERRUPTED"
+            }:
                 status = "UNKNOWN"
             reported_error = _read_attr(result_value, "error") if result_value is not None else None
         if isinstance(error, asyncio.CancelledError):
@@ -951,17 +1061,44 @@ class FourArmBenchmark:
                 "unsupported_rate": None,
                 "repair_success_rate": None,
                 "total_claims": None,
+                "accepted_claims_count": None,
+                "rejected_claims_count": None,
+                "needs_revision_claims_count": None,
+                "unverifiable_claims_count": None,
+                "unreviewed_claims_count": None,
+                "reviewed_claim_count": None,
             }
         else:
             accepted = verification_report.get("accepted_claims")
             rejected = verification_report.get("rejected_claims")
+            needs_revision = verification_report.get("needs_revision_claims")
+            unverifiable = verification_report.get("unverifiable_claims")
+            unreviewed = verification_report.get("unreviewed_claims")
+            accepted_count = len(accepted) if isinstance(accepted, list) else None
+            rejected_count = len(rejected) if isinstance(rejected, list) else None
+            needs_revision_count = len(needs_revision) if isinstance(needs_revision, list) else None
+            unverifiable_count = len(unverifiable) if isinstance(unverifiable, list) else None
+            unreviewed_count = len(unreviewed) if isinstance(unreviewed, list) else None
+            reviewed_count = (
+                accepted_count + rejected_count + needs_revision_count + unverifiable_count
+                if all(value is not None for value in (
+                    accepted_count, rejected_count, needs_revision_count, unverifiable_count
+                ))
+                else None
+            )
+            repair_history = verification_report.get("repair_history")
             verification = {
                 "support_rate": verification_report.get("support_rate"),
                 "unsupported_rate": verification_report.get("unsupported_rate"),
                 "repair_success_rate": verification_report.get("repair_success_rate"),
                 "total_claims": verification_report.get("total_claims"),
-                "accepted_claims_count": len(accepted) if isinstance(accepted, list) else None,
-                "rejected_claims_count": len(rejected) if isinstance(rejected, list) else None,
+                "accepted_claims_count": accepted_count,
+                "rejected_claims_count": rejected_count,
+                "needs_revision_claims_count": needs_revision_count,
+                "unverifiable_claims_count": unverifiable_count,
+                "unreviewed_claims_count": unreviewed_count,
+                "reviewed_claim_count": reviewed_count,
+                "repair_attempt_count": len(repair_history) if isinstance(repair_history, list) else None,
             }
         token_usage = accounting.token_usage if accounting is not None else _read_attr(result_value, "token_usage", {})
         token_usage = token_usage if isinstance(token_usage, dict) else {}
@@ -1009,31 +1146,46 @@ class FourArmBenchmark:
                 ) if eligible_count == 0 else None,
             )
         verification_metrics = {}
-        verification_available = arm is not BenchmarkArm.BASELINE
+        verification_available = (
+            arm is not BenchmarkArm.BASELINE
+            and bool(verification_report)
+        )
         for name in ("support_rate", "unsupported_rate", "repair_success_rate"):
             value = verification.get(name) if verification_available else None
             verification_metrics[name] = value
+            if not verification_available:
+                missing_reason = "verification not executed" if arm is BenchmarkArm.BASELINE else "verification report unavailable"
+            elif value is None and verification.get("reviewed_claim_count") == 0:
+                missing_reason = "no reviewed claims"
+            else:
+                missing_reason = "verification metric unavailable" if value is None else None
             measurements[f"verification_{name}"] = MetricMeasurement(
                 value=value,
                 eligible_sample_count=int(verification_available and value is not None),
                 attempt_count=1,
                 missing_count=int(value is None),
-                missingness_reason=(
-                    "verification not executed" if not verification_available
-                    else "verification metric unavailable"
-                ) if value is None else None,
+                missingness_reason=missing_reason,
             )
-        request_count = len(provider_calls) if accounting is not None else None
+        dropped_records = accounting.dropped_provider_call_records if accounting is not None else 0
+        request_counts = self._provider_request_counts(accounting, provider_calls, dropped_records)
+        request_count = request_counts["total_requests"]
+        has_resource_telemetry = accounting is not None or bool(provider_calls)
         retries = sum(1 for call in provider_calls if call.retry_number > 0 and not call.is_fallback)
-        failures = sum(1 for call in provider_calls if str(call.status) != "SUCCEEDED")
+        failures = request_counts["failed_requests"]
+        provider_timeouts = sum(
+            str(call.status).upper() == "TIMED_OUT" for call in provider_calls
+        )
         execution_metrics = {
             "attempt_count": 1,
             "successful_completion": float(success),
             "failure_or_interruption": float(not success),
             "latency_seconds": duration,
             "provider_request_count": request_count,
-            "retry_count": retries if accounting is not None else None,
-            "provider_failure_count": failures if accounting is not None else None,
+            "retry_count": retries if has_resource_telemetry else None,
+            "provider_failure_count": failures if has_resource_telemetry else None,
+            "provider_timeout_count": provider_timeouts if has_resource_telemetry else None,
+            "retry_counts_are_lower_bounds": bool(dropped_records or accounting is None),
+            "fallback_counts_are_lower_bounds": bool(dropped_records or accounting is None),
         }
         snapshot = BenchmarkConfigurationSnapshot(
             application_version=None,
@@ -1069,6 +1221,7 @@ class FourArmBenchmark:
             partial_answer=answer if not success and answer else None,
             metrics=measurements,
             execution_metrics=execution_metrics,
+            operational_telemetry=request_counts,
             verification_metrics=verification_metrics,
             provider_call_records=provider_calls,
             accounting=accounting,
@@ -1111,6 +1264,7 @@ class FourArmBenchmark:
             comparative_verification = comparative["verification_metrics"]
             aggregate[arm.value] = {
                 **operational,
+                "operational": operational,
                 "incompatible_attempt_count": comparative["incompatible_attempt_count"],
                 "compatible_attempt_count": comparative["compatible_attempt_count"],
                 "provider_request_count": operational["provider_request_count"]["value"],
@@ -1128,6 +1282,11 @@ class FourArmBenchmark:
                     "repair_success_rate": comparative_verification.get("verification_repair_success_rate", {}).get("value"),
                 },
                 "comparative": comparative,
+                "legacy_field_semantics": {
+                    "success_rate": "Operational rate over all attempted trials; use comparative.success_rate for compatible comparisons.",
+                    "metrics": "Comparative answer-quality metrics filtered by compatibility and metric eligibility.",
+                    "verification_metrics": "Comparative verification results; null when verification was not executed or eligible.",
+                },
             }
         return operational_aggregates, comparative_aggregates, aggregate
 
@@ -1149,22 +1308,14 @@ class FourArmBenchmark:
                 "missingness_reason": reason if len(available) < attempt_count else None,
             }
 
-        request_counts = []
-        failed_requests = []
-        for result in arm_results:
-            usage = result.accounting.token_usage if result.accounting is not None else {}
-            has_call_telemetry = result.accounting is not None or bool(result.provider_call_records)
-            request_counts.append(
-                int(usage["total_requests"])
-                if "total_requests" in usage
-                else len(result.provider_call_records) if has_call_telemetry else None
+        request_counts = [
+            FourArmBenchmark._provider_request_counts(
+                result.accounting,
+                result.provider_call_records,
+                result.dropped_provider_call_records,
             )
-            failed_requests.append(
-                int(usage["failed_requests"])
-                if "failed_requests" in usage
-                else sum(str(call.status).upper() != "SUCCEEDED" for call in result.provider_call_records)
-                if has_call_telemetry else None
-            )
+            for result in arm_results
+        ]
         retries = [
             sum(call.retry_number > 0 and not call.is_fallback for call in result.provider_call_records)
             if result.accounting is not None or result.provider_call_records
@@ -1225,6 +1376,14 @@ class FourArmBenchmark:
                 "uncertainty_reason": "one or more trial costs are unknown" if unknown_cost_count else None,
             }
 
+        any_dropped_records = any(
+            max(
+                result.dropped_provider_call_records,
+                result.accounting.dropped_provider_call_records if result.accounting else 0,
+            ) > 0
+            for result in arm_results
+        )
+
         return {
             "attempt_count": attempt_count,
             "compatible_attempt_count": sum(
@@ -1239,6 +1398,7 @@ class FourArmBenchmark:
             "failure_or_interruption_count": attempt_count - successful,
             "partial_failure_count": statuses.get("PARTIAL_FAILURE", 0),
             "failed_count": statuses.get("FAILED", 0) + statuses.get("EXCEPTION", 0),
+            "timed_out_count": statuses.get("TIMED_OUT", 0),
             "cancelled_count": statuses.get("CANCELLED", 0),
             "interrupted_count": statuses.get("INTERRUPTED", 0),
             "empty_output_count": statuses.get("EMPTY_OUTPUT", 0),
@@ -1252,12 +1412,45 @@ class FourArmBenchmark:
                 "available_attempt_count": len(durations),
                 "missing_count": attempt_count - len(durations),
             },
-            "provider_request_count": summarize(request_counts, "provider-call records unavailable"),
-            "failed_provider_request_count": summarize(failed_requests, "provider-call records unavailable"),
+            "provider_request_count": summarize(
+                [item["total_requests"] for item in request_counts],
+                "request count unavailable from snapshot or complete records",
+            ),
+            "provider_request_count_sources": dict(Counter(
+                item["request_count_source"] for item in request_counts
+            )),
+            "provider_request_count_is_lower_bound": any(
+                item["request_count_is_lower_bound"] for item in request_counts
+            ),
+            "failed_provider_request_count": summarize(
+                [item["failed_requests"] for item in request_counts],
+                "failed request count unavailable from snapshot or complete records",
+            ),
+            "failed_provider_request_count_sources": dict(Counter(
+                item["failure_count_source"] for item in request_counts
+            )),
+            "failed_provider_request_count_is_lower_bound": any(
+                item["failure_count_is_lower_bound"] for item in request_counts
+            ),
             "retry_count": summarize(retries, "provider-call records unavailable"),
             "fallback_request_count": summarize(fallback_requests, "provider-call records unavailable"),
             "retry_and_fallback_counts_are_lower_bounds": any(
-                result.dropped_provider_call_records > 0 for result in arm_results
+                max(
+                    result.dropped_provider_call_records,
+                    result.accounting.dropped_provider_call_records if result.accounting else 0,
+                ) > 0 for result in arm_results
+            ),
+            "provider_timeout_count": summarize([
+                sum(str(call.status).upper() == "TIMED_OUT" for call in result.provider_call_records)
+                if result.accounting is not None or result.provider_call_records
+                else None
+                for result in arm_results
+            ], "provider-call records unavailable"),
+            "provider_timeout_count_is_lower_bound": any(
+                max(
+                    result.dropped_provider_call_records,
+                    result.accounting.dropped_provider_call_records if result.accounting else 0,
+                ) > 0 for result in arm_results
             ),
             "provider_call_duration_seconds": summarize([
                 sum(call.duration_seconds or 0.0 for call in result.provider_call_records)
@@ -1267,9 +1460,22 @@ class FourArmBenchmark:
             ], "provider-call records unavailable"),
             "tokens": token_aggregates,
             "usage_source_counts": usage_sources,
+            "usage_completeness": {
+                "complete_attempt_count": sum(result.telemetry_complete for result in arm_results),
+                "incomplete_attempt_count": sum(not result.telemetry_complete for result in arm_results),
+                "provider_usage_requests": sum(
+                    int(result.accounting.token_usage.get("provider_usage_requests", 0) or 0)
+                    for result in arm_results if result.accounting is not None
+                ) if all(result.accounting is not None for result in arm_results) and arm_results else None,
+                "estimated_usage_requests": sum(
+                    int(result.accounting.token_usage.get("estimated_usage_requests", 0) or 0)
+                    for result in arm_results if result.accounting is not None
+                ) if all(result.accounting is not None for result in arm_results) and arm_results else None,
+            },
             "dropped_provider_call_records": dropped_records,
             "telemetry_complete_attempt_count": sum(result.telemetry_complete for result in arm_results),
             "telemetry_incomplete_attempt_count": sum(not result.telemetry_complete for result in arm_results),
+            "any_provider_call_records_dropped": any_dropped_records,
             "trial_execution_cost": summarize_costs("trial_execution_cost"),
             "end_to_end_comparison_cost": summarize_costs("end_to_end_cost"),
             "quality_eligible_attempt_count": sum(result.quality_eligible for result in arm_results),
@@ -1328,6 +1534,41 @@ class FourArmBenchmark:
             name: aggregate_measurements(name, verification=True)
             for name in sorted(verification_metric_names)
         }
+        verification_trials = [
+            result for result in compatible_results
+            if result.arm_id != BenchmarkArm.BASELINE.value
+            and result.verification_metrics.get("reviewed_claim_count") is not None
+        ]
+        pooled_counts = {
+            name: sum(
+                int(result.verification_metrics.get(f"{name}_count") or 0)
+                for result in verification_trials
+            )
+            for name in (
+                "accepted_claims", "rejected_claims", "needs_revision_claims",
+                "unverifiable_claims", "unreviewed_claims",
+            )
+        }
+        pooled_reviewed = sum(
+            int(result.verification_metrics.get("reviewed_claim_count") or 0)
+            for result in verification_trials
+        )
+        pooled_support_rate = (
+            round(pooled_counts["accepted_claims"] / pooled_reviewed * 100, 6)
+            if pooled_reviewed else None
+        )
+        pooled_unsupported_rate = (
+            round(
+                (pooled_counts["rejected_claims"] + pooled_counts["unverifiable_claims"])
+                / pooled_reviewed * 100,
+                6,
+            )
+            if pooled_reviewed else None
+        )
+        mean_trial_verification_rates = {
+            name: verification.get(f"verification_{name}", {}).get("value")
+            for name in ("support_rate", "unsupported_rate", "repair_success_rate")
+        }
         successes = sum(result.success for result in compatible_results)
         return {
             "attempt_count": len(arm_results),
@@ -1338,6 +1579,25 @@ class FourArmBenchmark:
             "failure_or_interruption_count": len(compatible_results) - successes,
             "quality_eligible_count": sum(result.quality_eligible for result in compatible_results),
             "answer_quality_metrics": answer_quality,
+            "verification_aggregation": {
+                "mean_trial_rates": mean_trial_verification_rates,
+                "mean_trial_denominators": {
+                    name: verification.get(f"verification_{name}", {}).get("eligible_sample_count", 0)
+                    for name in ("support_rate", "unsupported_rate", "repair_success_rate")
+                },
+                "pooled_claim_level": {
+                    "accepted_claims": pooled_counts["accepted_claims"],
+                    "rejected_claims": pooled_counts["rejected_claims"],
+                    "needs_revision_claims": pooled_counts["needs_revision_claims"],
+                    "unverifiable_claims": pooled_counts["unverifiable_claims"],
+                    "unreviewed_claims": pooled_counts["unreviewed_claims"],
+                    "reviewed_claim_denominator": pooled_reviewed,
+                    "support_rate": pooled_support_rate,
+                    "unsupported_rate": pooled_unsupported_rate,
+                    "trial_count": len(verification_trials),
+                    "missing_count": len(compatible_results) - len(verification_trials),
+                },
+            },
             "verification_metrics": verification if arm is not BenchmarkArm.BASELINE else {
                 name: {
                     "value": None,
@@ -1368,6 +1628,20 @@ class FourArmBenchmark:
                     usage = result.accounting.token_usage if result.accounting else {}
                     metrics = result.metrics
                     calls = result.provider_call_records
+                    request_counts = FourArmBenchmark._provider_request_counts(
+                        result.accounting,
+                        calls,
+                        result.dropped_provider_call_records,
+                    )
+                    compatibility = result.configuration
+                    metric_eligibility = {
+                        name: item.eligible_sample_count for name, item in metrics.items()
+                    }
+                    metric_missingness = {
+                        name: item.missingness_reason
+                        for name, item in metrics.items()
+                        if item.missingness_reason is not None
+                    }
                     row = {
                         "experiment_id": result.experiment_id,
                         "task_block_id": result.task_block_id,
@@ -1388,6 +1662,12 @@ class FourArmBenchmark:
                         "error_category": result.error_category,
                         "verification_support_rate": result.verification_metrics.get("support_rate"),
                         "verification_unsupported_rate": result.verification_metrics.get("unsupported_rate"),
+                        "verification_reviewed_claim_count": result.verification_metrics.get("reviewed_claim_count"),
+                        "verification_accepted_claims_count": result.verification_metrics.get("accepted_claims_count"),
+                        "verification_rejected_claims_count": result.verification_metrics.get("rejected_claims_count"),
+                        "verification_needs_revision_claims_count": result.verification_metrics.get("needs_revision_claims_count"),
+                        "verification_unverifiable_claims_count": result.verification_metrics.get("unverifiable_claims_count"),
+                        "verification_unreviewed_claims_count": result.verification_metrics.get("unreviewed_claims_count"),
                         "metric_eligible_samples": sum(item.eligible_sample_count for item in metrics.values()),
                         "metric_attempt_count": sum(item.attempt_count for item in metrics.values()),
                         "metric_missing_count": sum(item.missing_count for item in metrics.values()),
@@ -1397,11 +1677,65 @@ class FourArmBenchmark:
                         "provider_reported_total_tokens": usage.get("total_tokens"),
                         "estimated_total_tokens": usage.get("estimated_tokens_without_usage"),
                         "usage_source": usage.get("usage_source", "unknown"),
-                        "provider_request_count": len(calls) if result.accounting else None,
+                        "provider_request_count": request_counts["total_requests"],
+                        "failed_provider_request_count": request_counts["failed_requests"],
+                        "provider_request_count_source": request_counts["request_count_source"],
+                        "failed_provider_request_count_source": request_counts["failure_count_source"],
+                        "provider_request_count_is_lower_bound": request_counts["request_count_is_lower_bound"],
+                        "failed_provider_request_count_is_lower_bound": request_counts["failure_count_is_lower_bound"],
                         "retry_count": sum(
                             call.retry_number > 0 and not call.is_fallback for call in calls
-                        ) if result.accounting else None,
-                        "provider_failure_count": sum(str(call.status) != "SUCCEEDED" for call in calls) if result.accounting else None,
+                        ) if result.accounting or calls else None,
+                        "fallback_request_count": sum(call.is_fallback for call in calls) if result.accounting or calls else None,
+                        "provider_failure_count": request_counts["failed_requests"],
+                        "provider_failure_count_is_lower_bound": request_counts["failure_count_is_lower_bound"],
+                        "provider_timeout_count": sum(str(call.status).upper() == "TIMED_OUT" for call in calls) if result.accounting or calls else None,
+                        "provider_timeout_count_is_lower_bound": bool(
+                            result.accounting is None
+                            or max(
+                                result.dropped_provider_call_records,
+                                result.accounting.dropped_provider_call_records,
+                            )
+                        ),
+                        "timed_out_count": int(result.status == "TIMED_OUT"),
+                        "retry_counts_are_lower_bounds": bool(
+                            result.accounting is None
+                            or max(
+                                result.dropped_provider_call_records,
+                                result.accounting.dropped_provider_call_records,
+                            )
+                        ),
+                        "fallback_counts_are_lower_bounds": bool(
+                            result.accounting is None
+                            or max(
+                                result.dropped_provider_call_records,
+                                result.accounting.dropped_provider_call_records,
+                            )
+                        ),
+                        "usage_complete": result.telemetry_complete,
+                        "usage_completeness": json.dumps({
+                            "provider_usage_requests": usage.get("provider_usage_requests"),
+                            "estimated_usage_requests": usage.get("estimated_usage_requests"),
+                            "accounting_available": result.accounting is not None,
+                        }, sort_keys=True),
+                        "compatibility_status": compatibility.compatibility_status if compatibility else "INDETERMINATE",
+                        "compatibility_limitations": json.dumps(
+                            compatibility.compatibility_limitations if compatibility else [],
+                            ensure_ascii=False,
+                        ),
+                        "compatibility_exclusion_reason": json.dumps(
+                            (
+                                compatibility.compatibility_differences
+                                if compatibility and compatibility.compatibility_differences
+                                else compatibility.compatibility_limitations
+                                if compatibility and not compatibility.compatible
+                                else []
+                            ),
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        ),
+                        "metric_eligibility": json.dumps(metric_eligibility, sort_keys=True),
+                        "metric_missingness_reasons": json.dumps(metric_missingness, sort_keys=True),
                         "telemetry_complete": result.telemetry_complete,
                         "dropped_provider_call_records": result.dropped_provider_call_records,
                         "plan_preparation_cost_usd": result.plan_preparation_cost.get("amount_usd"),

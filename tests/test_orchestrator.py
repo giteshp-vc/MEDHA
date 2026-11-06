@@ -107,6 +107,28 @@ def test_frozen_plan_rejects_task_identity_mismatch_and_tampering():
             serialized_plan=frozen.serialized_plan + " ",
             plan_hash=frozen.plan_hash,
         ).load_plan(frozen.source_task)
+    with pytest.raises(ValueError, match="hash does not match"):
+        FrozenTaskPlan(
+            source_task="Rebound source task",
+            serialized_plan=frozen.serialized_plan,
+            plan_hash=frozen.plan_hash,
+        ).load_plan("Rebound source task")
+
+
+@pytest.mark.parametrize(
+    "status",
+    [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED],
+)
+def test_frozen_plan_rejects_subtasks_with_prior_execution_state(status):
+    plan = TaskPlan(
+        task="Execution-state validation",
+        subtasks=[SubTask(id="T1", role="Analyst", objective="Analyze", status=status)],
+    )
+
+    with pytest.raises(ValueError, match="frozen plans require every subtask to be PENDING"):
+        FrozenTaskPlan.from_plan("Source task", plan)
+
+    assert plan.subtasks[0].status == status
 
 
 def _mock_llm_response(text: str):
@@ -697,6 +719,10 @@ async def test_orchestrator_quota_exhaustion_during_verification_reports_partial
 async def test_orchestrator_registers_all_structured_claims_after_extraction_quota(
     monkeypatch,
 ):
+    from verification.evidence_ledger import EvidenceLedger
+
+    # Pin the code default so a local .env MAX_CLAIMS_PER_TASK override cannot change this test.
+    monkeypatch.setattr(EvidenceLedger.__init__, "__defaults__", ("", 50))
     mock_client = MagicMock()
     mock_client.aio.models.generate_content = AsyncMock(
         side_effect=LLMQuotaExhaustedError("daily provider quota exhausted during extraction")

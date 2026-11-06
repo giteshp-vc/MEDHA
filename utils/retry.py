@@ -29,6 +29,15 @@ QUOTA_EXHAUSTION_KEYWORDS = [
     "quota_exceeded",
 ]
 
+# Per-minute windows are transient even if the provider message also links to billing.
+PER_MINUTE_LIMIT_KEYWORDS = [
+    "tokens per minute",
+    "requests per minute",
+    "(tpm)",
+    "(rpm)",
+    "per minute",
+]
+
 
 class LLMError(Exception):
     """Base exception for LLM operations."""
@@ -210,6 +219,13 @@ def classify_error(exc: Exception) -> Tuple[bool, LLMError]:
         return False, LLMQuotaExhaustedError(
             f"Daily quota limit exhausted (retry-after: {retry_after:.1f}s): {msg}",
             status_code=429,
+        )
+
+    if any(kw in lower_msg for kw in PER_MINUTE_LIMIT_KEYWORDS):
+        return True, LLMRateLimitError(
+            f"Transient rate limit (429): {msg}",
+            status_code=429,
+            retry_after=retry_after,
         )
 
     for kw in QUOTA_EXHAUSTION_KEYWORDS:

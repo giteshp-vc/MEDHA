@@ -1,3 +1,4 @@
+import csv
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 import pytest
@@ -65,7 +66,9 @@ def test_compute_system_metrics_calculation():
     assert metrics.total_api_requests == 8
     assert metrics.reference_criteria_coverage == 0.85
     assert metrics.claim_support_rate == 0.90
-    assert metrics.estimated_cost_usd == 0.0
+    assert metrics.estimated_cost_usd is None
+    assert metrics.known_cost_subtotal_usd is None
+    assert metrics.unknown_cost_count == 2
     assert metrics.cost_status == "unknown"
 
 
@@ -413,9 +416,135 @@ def test_cost_labels_actual_estimated_and_unknown():
     unknown = evaluator.evaluate_answer(**common, token_usage={})
 
     assert actual.cost["status"] == "actual"
+    assert actual.cost["amount_usd"] == pytest.approx(0.0002)
     assert estimated.cost["status"] == "estimated"
+    assert estimated.cost["amount_usd"] is None
     assert unknown.cost["status"] == "unknown"
     assert unknown.cost["amount_usd"] is None
+    mixed = evaluator.evaluate_answer(
+        **common,
+        token_usage={
+            "prompt_tokens": 100,
+            "candidate_tokens": 50,
+            "estimated_tokens_without_usage": 75,
+            "accounted_total_tokens": 225,
+            "usage_source": "mixed",
+            "failed_requests": 1,
+        },
+    )
+    assert mixed.cost["status"] == "mixed"
+    assert mixed.cost["amount_usd"] is None
+    failed_without_usage = evaluator.evaluate_answer(
+        **{**common, "completion_status": "FAILED"},
+        token_usage={"usage_source": "unknown", "failed_requests": 1},
+        error="Provider request failed.",
+    )
+    assert failed_without_usage.cost["status"] == "unknown"
+    assert failed_without_usage.cost["amount_usd"] is None
+
+
+@pytest.mark.parametrize(
+    "pricing",
+    [
+        {"groq:same-model": {"output_per_million_usd": 2.0}},
+        {"groq:same-model": {"input_per_million_usd": 1.0}},
+        {"groq": {"input_per_million_usd": 1.0}},
+    ],
+)
+def test_legacy_cost_requires_complete_explicit_input_output_rates(pricing):
+    evaluator = BenchmarkEvaluator(pricing=pricing)
+    result = evaluator.evaluate_answer(
+        task_id="incomplete-price",
+        domain="Tech",
+        mode="BASELINE",
+        prompt="Task",
+        answer="Answer",
+        duration=1.0,
+        token_usage={
+            "prompt_tokens": 100,
+            "candidate_tokens": 50,
+            "total_tokens": 150,
+            "usage_source": "provider",
+        },
+        reference_criteria=[],
+        known_pitfalls=[],
+        configuration={"provider": "groq", "model": "same-model"},
+        completion_status="SUCCESS",
+    )
+
+    assert result.cost["amount_usd"] is None
+    assert result.cost["status"] == "unknown"
+
+
+def test_legacy_unknown_cost_is_null_in_csv(tmp_path):
+    result = TaskEvaluationResult(
+        task_id="unknown-cost",
+        domain="Tech",
+        mode="BASELINE",
+        prompt="Task",
+        answer="Answer",
+        success=True,
+        duration_seconds=1.0,
+        cost={"amount_usd": None, "status": "unknown", "usage_source": "unknown"},
+    )
+    csv_path = tmp_path / "legacy-cost.csv"
+    BenchmarkEvaluator().save_csv_report([result], [], csv_path)
+    row = next(csv.DictReader(csv_path.open(encoding="utf-8", newline="")))
+    assert row["cost_amount_usd"] == "null"
+    assert row["cost_status"] == "unknown"
+
+
+def test_legacy_cost_aggregate_keeps_unknown_total_separate_from_known_subtotal():
+    common = {
+        "task_id": "cost-aggregate",
+        "domain": "Tech",
+        "mode": "BASELINE",
+        "prompt": "Task",
+        "answer": "Answer",
+        "success": True,
+        "duration_seconds": 1.0,
+    }
+    priced = TaskEvaluationResult(
+        **common,
+        trial_id="priced",
+        cost={"amount_usd": 0.0002, "status": "actual"},
+    )
+    unknown = TaskEvaluationResult(
+        **common,
+        trial_id="unknown",
+        cost={"amount_usd": None, "status": "unknown"},
+    )
+
+    metrics = compute_system_metrics("BASELINE", [priced, unknown])
+
+    assert metrics.estimated_cost_usd is None
+    assert metrics.known_cost_subtotal_usd == pytest.approx(0.0002)
+    assert metrics.unknown_cost_count == 1
+    assert metrics.cost_status == "unknown"
+    assert metrics.cost_provenance_counts == {"actual": 1, "unknown": 1}
+
+
+def test_legacy_cost_aggregate_sums_complete_priced_trials():
+    results = [
+        TaskEvaluationResult(
+            task_id=f"priced-{index}",
+            domain="Tech",
+            mode="BASELINE",
+            prompt="Task",
+            answer="Answer",
+            success=True,
+            duration_seconds=1.0,
+            cost={"amount_usd": 0.0002, "status": "actual"},
+        )
+        for index in range(2)
+    ]
+
+    metrics = compute_system_metrics("BASELINE", results)
+
+    assert metrics.estimated_cost_usd == pytest.approx(0.0004)
+    assert metrics.known_cost_subtotal_usd == pytest.approx(0.0004)
+    assert metrics.unknown_cost_count == 0
+    assert metrics.cost_status == "actual"
 
 
 @pytest.mark.asyncio
@@ -487,6 +616,7 @@ async def test_benchmark_evaluator_run(tmp_path):
     assert "Summary Metrics Comparison" in md_summary
     assert "Single-Agent Baseline" in md_summary
     assert "MEDHA Multi-Agent" in md_summary
+    assert "unknown: N/A" in md_summary
 
 
 @pytest.mark.asyncio

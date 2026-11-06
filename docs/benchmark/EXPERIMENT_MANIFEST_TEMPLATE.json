@@ -1,0 +1,167 @@
+{
+  "protocol_version": "5.2G-draft-1",
+  "manifest_status": "DRAFT_NOT_AUTHORIZED",
+  "experiment_id": null,
+  "created_at": "2026-11-06",
+  "source_freeze": {
+    "branch": "vaibhavi-medha",
+    "commit": "8949ab200f03dc3ca4c4926fac621c1a68774fae",
+    "worktree_clean": false,
+    "tracked_diff_sha256": "F7524CE0EBB643194FF3C5A23A4297880BE82FF3DD4BE54F981A9894B61724D2",
+    "tracked_modified_paths": [
+      "README.md",
+      "benchmark/evaluator.py",
+      "benchmark/experiment.py",
+      "benchmark/four_arm.py",
+      "benchmark/metrics.py",
+      "models/frozen_plan.py",
+      "tests/test_benchmark.py",
+      "tests/test_four_arm_benchmark.py",
+      "tests/test_orchestrator.py",
+      "tests/test_verification.py"
+    ],
+    "untracked_user_data_excluded_from_patch_hash": [
+      "benchmark/outputs/smoke/medha-smoke-20261105.csv",
+      "benchmark/outputs/smoke/medha-smoke-20261105.json"
+    ],
+    "python_version": "3.13.16",
+    "dependency_lockfile": {
+      "path": null,
+      "status": "not found"
+    },
+    "requirements_file": {
+      "path": "requirements.txt",
+      "sha256": "64A7FCCC09A216A9997C4D76436E37CD29C7364476273F9445B8F6BCCCDCABFE"
+    },
+    "relevant_dependency_versions": {
+      "pytest": "9.2.0",
+      "pytest-asyncio": "1.4.1.post1",
+      "pydantic": "2.14.2",
+      "groq": "1.7.0",
+      "google-genai": "2.34.0",
+      "mcp": "2.3.0",
+      "httpx": "0.28.1"
+    },
+    "benchmark_source_sha256": {
+      "benchmark/four_arm.py": "6023924B43EA08198A23A73C62576E738B5468C5D101BCE279FF302E9B9CBDC3",
+      "benchmark/experiment.py": "2CE0203C0C7249213506936D10B5F46E80B1C6305F5DC4F274B143A641A26BE6",
+      "benchmark/evaluator.py": "29AFBBC9F2FA128FA1F5CCD89F538B0E64EC2CAF095717A1BC22917573EF5C03",
+      "benchmark/metrics.py": "0200B356F3682197CC2FC26261A79220E64D59BD600823A7846AC140918CB6D1",
+      "benchmark/baseline.py": "741F119B4038A80420939883F3722B396931DAF3CD12B3942121F8C9B8EAF3BB",
+      "benchmark/medha_runner.py": "D4ED87E70F2D422D2914F8C1307829170BFCEB6E05951AF193BDAD25D54B60FA",
+      "models/frozen_plan.py": "FF132CF623D8EC10D51BCC8F2A3405E01B885A72BD1153B7CCEC42795074002C",
+      "models/execution_policy.py": "C95C1D326D93DC3C69E765082FE9822CABFC62284F9F6EA657DDB807983D3B1F",
+      "models/provider_call.py": "999630E3A1EDF222BAC13DB3FCD5EE48A5438D4AC8F809655410C46B9195D653",
+      "core/orchestrator.py": "DA5B540E2B45B5B3B3DA73E7AEC524D583D93229D6E8200BE45232D97A0535DD",
+      "core/execution_engine.py": "AC2ABA60B5ACEF7677FC0D2167948F35D67F189BCDEB60E91F595894E9FA3186",
+      "core/task_manager.py": "E5E26CBE4070533D8EF4E3D54AE392BF945F6DA50A2F0A6A2F73D3E8BCBD8826",
+      "communication/message_bus.py": "5276703A347E478779BF5CA5EF82F3469DF770555CFE68D965879C7FAFC04713",
+      "communication/shared_context.py": "8237C427E45D4D8F9B062FBEE4FDF78E90B0A4765E7425DFBAE68F73DC87905C",
+      "communication/deliberation_coordinator.py": "691F0971FE96971392AA63A80472ED9760CC1123E424548E40F0C47AF04BB6B5",
+      "utils/token_tracker.py": "A84ED2AA9F331E6753E61A285E502F55535BB3756FDBB432099B68B052650CC4",
+      "tests/test_four_arm_benchmark.py": "BD8D0125F8FEA951B2655D26755F0F991FF1E794510A2332B072E8F928A1521C",
+      "tests/test_benchmark.py": "EE4A991955E4190A1265716D10397EEE50317EE475AA00228855C2299B298268",
+      "tests/test_provider_telemetry.py": "04C0758427C935B991066D9DE0CAC65C76315899D22F65692DF6E2B0261665A7"
+    },
+    "captured_at": "2026-11-06",
+    "note": "These hashes identify the inspected pre-pilot source state. Regenerate after any code, config, or test changes; protocol docs themselves are not included in the tracked-source diff hash."
+  },
+  "dataset": {
+    "pilot_dataset_version": null,
+    "pilot_dataset_sha256": null,
+    "status": "OPEN_NOT_APPROVED",
+    "existing_legacy_candidate": {
+      "path": "benchmark/benchmark_dataset.json",
+      "case_count": 5,
+      "sha256": "3B98A9D353673A2E708EF0210EDFB0B731C448A3C480888F2A3E9395F419DF73",
+      "status": "not independently validated; not selected for pilot"
+    },
+    "evidence_corpora": []
+  },
+  "arms": {
+    "A": {"name": "single_agent_baseline", "plan": false, "dependency_scheduling": false, "upstream_context": false, "message_routing": false, "deliberation": false, "verification_repair_synthesis": false},
+    "B": {"name": "independent_parallel", "plan": true, "dependency_scheduling": false, "upstream_context": false, "message_routing": false, "deliberation": false, "verification_repair_synthesis": true},
+    "C": {"name": "dependency_aware", "plan": true, "dependency_scheduling": true, "upstream_context": true, "message_routing": true, "deliberation": false, "verification_repair_synthesis": true},
+    "D": {"name": "full_medha", "plan": true, "dependency_scheduling": true, "upstream_context": true, "message_routing": true, "deliberation": true, "verification_repair_synthesis": true}
+  },
+  "provider_configuration": {
+    "provider": {"value": null, "status": "OPEN", "allowed_options": ["groq", "gemini"]},
+    "model_identifier": {"value": null, "status": "OPEN"},
+    "operator_model_label": {"value": null, "status": "OPEN_NOT_READ_FROM_ENV"},
+    "provider_attested_immutable_revision": {"value": null, "status": "unknown_until_response_metadata_or_provider_documentation"},
+    "provider_revision_policy": "Never fabricate revisions; mutable aliases remain an explicit limitation.",
+    "pricing": {"value": null, "status": "OPEN_NOT_VERIFIED"},
+    "maximum_cost_usd": {"value": null, "status": "OPEN"}
+  },
+  "stage_configuration": {
+    "planning": {"temperature_source_default": 0.2, "active_temperature": null, "status": "OPEN"},
+    "specialist_execution": {"temperature_source_default": 0.2, "active_temperature": null, "status": "OPEN"},
+    "verification_reviewer": {"temperature_source_default": 0.1, "active_temperature": null, "status": "OPEN"},
+    "repair": {"temperature_source_default": 0.2, "active_temperature": null, "status": "OPEN"},
+    "synthesis": {"temperature_source_default": 0.2, "active_temperature": null, "status": "OPEN"},
+    "deliberation": {"temperature_source": "target specialist temperature", "active_temperature": null, "status": "OPEN"},
+    "input_token_limit_source_default": 12000,
+    "output_token_limit_source_default": 2048,
+    "active_input_token_limit": null,
+    "active_output_token_limit": null,
+    "active_provider_request_timeout_seconds": null,
+    "provider_sdk_default_timeout_duration": {"value": null, "status": "OPEN_UNAVAILABLE"}
+  },
+  "resource_policy": {
+    "max_llm_calls_per_execution_source_default": 25,
+    "max_tokens_per_execution_source_default": 50000,
+    "execution_timeout_seconds_source_default": 180.0,
+    "max_retries_source_default": 3,
+    "deliberation_timeout_seconds_source_default": 20.0,
+    "max_deliberation_tokens_source_default": 4096,
+    "pilot_max_provider_requests": {"value": null, "status": "OPEN_NO_EXPERIMENT_WIDE_CAP_IN_CODE"},
+    "pilot_max_duration_seconds": {"value": null, "status": "OPEN_NO_EXPERIMENT_WIDE_DEADLINE_IN_CODE"},
+    "maximum_cost_usd": {"value": null, "status": "OPEN_NO_VERIFIED_PRICING"},
+    "default_theoretical_request_ceiling_per_block": 125,
+    "ceiling_explanation": "At source defaults: plan preparation plus four independent arm executions, each with a 25-call budget. This is not a global enforced experiment cap and active environment overrides are OPEN."
+  },
+  "design": {
+    "proposed_task_blocks": 8,
+    "proposed_repetitions_per_block": 1,
+    "planned_arm_trials": 32,
+    "schedule": "Williams four-sequence cycle; two appearances per sequence across eight blocks",
+    "randomization_seed": null,
+    "task_order_status": "OPEN: predeclare category-stratified task order before execution",
+    "primary_outcome": "OPEN_APPROVAL: blinded human task correctness score 1-5, with task-specific frozen acceptance key",
+    "scoring_rubric_version": "human-rubric-draft-1",
+    "confirmatory_analysis": false,
+    "power_calculation": {"status": "OPEN_NO_VARIANCE_OR_EFFECT_SIZE_ESTIMATE"}
+  },
+  "retry_and_exclusion_policy": {
+    "retry_policy": "Use frozen provider client retries; preserve every wire attempt; no replacement trial without a new trial ID and retained original.",
+    "failed_attempts_retained": true,
+    "compatible_comparison_requires": ["known common-stage settings equal", "required stage metadata available", "no dropped configuration telemetry", "metric-specific eligibility"],
+    "incompatible_trials": "Operational aggregates include them; comparative quality excludes them with reason.",
+    "provider_quota_or_billing_failure": "Stop before starting another arm/block; preserve prior attempts.",
+    "telemetry_truncation_or_snapshot_missing": "Stop the pilot; mark configuration indeterminate and comparative ineligible.",
+    "known_configuration_difference": "Stop before another block; retain records and do not compare affected trials.",
+    "unstarted_arm": "Record as unstarted/missing, not a fabricated failure or answer score."
+  },
+  "test_baseline": {
+    "execution_date": "2026-11-06",
+    "focused_tests_passed": 260,
+    "full_tests_passed": 297,
+    "credentials_unset": true,
+    "live_provider_calls": 0,
+    "benchmark_runs": 0,
+    "note": "Offline tests were run on the inspected pre-pilot source state; rerun after final source freeze."
+  },
+  "human_evaluation": {
+    "status": "OPEN_NOT_IMPLEMENTED",
+    "raters_per_answer": 2,
+    "blinding": "opaque answer IDs; random answer order; remove arm/execution/agent/provider metadata",
+    "adjudication": "third blinded rater for >=2 point disagreement or pass/fail disagreement",
+    "inter_rater_reporting": "weighted Cohen kappa with confidence interval, raw agreement, denominators"
+  },
+  "authorization": {
+    "authorized": false,
+    "approver": null,
+    "approval_reference": null,
+    "authorized_at": null
+  }
+}

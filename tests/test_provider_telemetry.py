@@ -588,6 +588,39 @@ async def test_groq_structured_format_fallback_records_each_wire_attempt():
 
 
 @pytest.mark.asyncio
+async def test_groq_json_validate_failed_falls_back_to_plain_text():
+    sdk_client = MagicMock()
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content='{"value":"accepted"}'))],
+        usage=SimpleNamespace(prompt_tokens=5, completion_tokens=3, total_tokens=8),
+    )
+    json_mode_rejection = RuntimeError(
+        "Error code: 400 - {'error': {'message': \"Failed to validate JSON. Please adjust your prompt.\", "
+        "'type': 'invalid_request_error', 'code': 'json_validate_failed', 'failed_generation': ''}}"
+    )
+    sdk_client.chat.completions.create = AsyncMock(side_effect=[json_mode_rejection, response])
+    tracker = TokenTracker(name="groq_json_validate_test", essential_token_reserves={})
+    client = GroqClient(
+        api_key="mock-secret-never-record",
+        default_model="mock-groq-model",
+        token_tracker=tracker,
+        client=sdk_client,
+    )
+
+    async with tracker.task_budget(essential_reserves={}):
+        output = await client.generate_structured(
+            prompt="safe structured request",
+            response_schema=_StructuredAnswer,
+            max_retries=0,
+        )
+
+    assert output.value == "accepted"
+    assert sdk_client.chat.completions.create.await_count == 2
+    assert "response_format" in sdk_client.chat.completions.create.await_args_list[0].kwargs
+    assert "response_format" not in sdk_client.chat.completions.create.await_args_list[1].kwargs
+
+
+@pytest.mark.asyncio
 async def test_normal_medha_execution_persists_provider_calls_without_benchmark_scope(monkeypatch):
     from core.orchestrator import MedhaOrchestrator
 

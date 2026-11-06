@@ -21,6 +21,7 @@ from benchmark.experiment import (
 )
 from benchmark.four_arm import _cost_for
 from benchmark.four_arm import FourArmBenchmark
+from benchmark.treatments import BenchmarkArm
 from models.provider_call import ProviderCallRecord
 from models.frozen_plan import FrozenTaskPlan
 from models.provider_call import (
@@ -89,11 +90,20 @@ def _snapshot(
 
 
 class FakeBaseline:
-    def __init__(self, config=None, effective_model="mock-model", missing_provider_metadata=False):
+    def __init__(
+        self,
+        config=None,
+        effective_model="mock-model",
+        missing_provider_metadata=False,
+        success=True,
+        error=None,
+    ):
         self.calls = []
         self.config = config or _configuration()
         self.effective_model = effective_model
         self.missing_provider_metadata = missing_provider_metadata
+        self.success = success
+        self.error = error
 
     def benchmark_configuration(self):
         return self.config
@@ -109,8 +119,8 @@ class FakeBaseline:
             answer="Answer with evidence and source references.",
             execution_id="baseline-exec",
             duration_seconds=0.1,
-            success=True,
-            error=None,
+            success=self.success,
+            error=self.error,
             token_usage={},
             accounting=_snapshot(
                 context,
@@ -136,14 +146,151 @@ def _configuration():
     }
 
 
+def _compatibility_experiment(stage_profiles, dropped_by_arm=None):
+    arms = [
+        "BASELINE",
+        "INDEPENDENT_PARALLEL",
+        "DEPENDENCY_AWARE",
+        "FULL_MEDHA",
+    ]
+    config = {**_configuration(), "provider_request_timeout_seconds": None}
+    snapshots = {
+        arm: BenchmarkConfigurationSnapshot(provider_configuration=config)
+        for arm in arms
+    }
+    dropped_by_arm = dropped_by_arm or {}
+    trials = []
+    for arm in arms:
+        context = AccountingContext(
+            experiment_id="stage-compatibility",
+            task_block_id="block-1",
+            trial_id=f"stage-compatibility:{arm}",
+            treatment_id=arm,
+            execution_id=f"exec-{arm}",
+            scope_kind="trial_execution",
+        )
+        records = []
+        for attempt_number, profile in enumerate(stage_profiles[arm], start=1):
+            records.append(ProviderCallRecord(
+                attempt_number=attempt_number,
+                provider=profile.get("provider", "groq"),
+                model=profile.get("model", "mock-model"),
+                temperature=profile.get("temperature", 0.2),
+                input_token_limit=profile.get("input_token_limit", 1000),
+                output_token_limit=profile.get("output_token_limit", 100),
+                timeout_seconds=profile.get("timeout_seconds"),
+                timeout_source=profile.get("timeout_source", "provider_sdk_default"),
+                stage=profile.get("stage"),
+                model_version=profile.get("model_version"),
+                model_version_source=profile.get("model_version_source", "unavailable"),
+                response_model=profile.get("response_model"),
+                status=ProviderCallStatus.SUCCEEDED,
+            ))
+        dropped = dropped_by_arm.get(arm, 0)
+        result = BenchmarkArmResult(
+            experiment_id="stage-compatibility",
+            task_block_id="block-1",
+            trial_id=context.trial_id,
+            execution_id=context.execution_id,
+            arm_id=arm,
+            task_id="synthetic-task",
+            repetition=1,
+            start_timestamp="start",
+            end_timestamp="end",
+            duration_seconds=1.0,
+            status="SUCCESS",
+            success=True,
+            quality_eligible=True,
+            accounting=AccountingSnapshot(
+                context=context,
+                duration_seconds=1.0,
+                token_usage={
+                    "total_requests": len(records) + dropped,
+                    "failed_requests": 0,
+                },
+                provider_calls=records,
+                dropped_provider_call_records=dropped,
+            ),
+            metrics={
+                "answer_completeness": MetricMeasurement(
+                    value=1.0,
+                    eligible_sample_count=1,
+                    attempt_count=1,
+                )
+            },
+            provider_call_records=records,
+            dropped_provider_call_records=dropped,
+            configuration=snapshots[arm],
+        )
+        trials.append(BenchmarkTrial(
+            trial_id=result.trial_id,
+            task_block_id="block-1",
+            repetition=1,
+            arm_id=arm,
+            planned_order=arms,
+            actual_order=arms,
+            result=result,
+        ))
+    plan_context = AccountingContext(
+        experiment_id="stage-compatibility",
+        task_block_id="block-1",
+        trial_id=None,
+        treatment_id=None,
+        execution_id="planning-exec",
+        scope_kind="plan_preparation",
+    )
+    planner_call = ProviderCallRecord(
+        attempt_number=1,
+        provider="groq",
+        model="mock-model",
+        model_version_source="unavailable",
+        temperature=0.2,
+        input_token_limit=1000,
+        output_token_limit=100,
+        timeout_source="provider_sdk_default",
+        stage="planning",
+        status=ProviderCallStatus.SUCCEEDED,
+    )
+    planning_accounting = AccountingSnapshot(
+        context=plan_context,
+        duration_seconds=1.0,
+        token_usage={"total_requests": 1, "failed_requests": 0},
+        provider_calls=[planner_call],
+    )
+    experiment = BenchmarkExperiment(
+        experiment_id="stage-compatibility",
+        created_at="now",
+        repetitions=1,
+        configuration_snapshots=snapshots,
+        task_blocks=[BenchmarkTaskBlock(
+            task_block_id="block-1",
+            task_id="synthetic-task",
+            task_text="synthetic",
+            plan_preparation_accounting=planning_accounting,
+            trials=trials,
+        )],
+    )
+    return experiment
+
+
 class FakeOrchestrator:
-    def __init__(self, *, planning_error=None, interrupt_arm=None, missing_provider_metadata=False):
+    def __init__(
+        self,
+        *,
+        planning_error=None,
+        interrupt_arm=None,
+        missing_provider_metadata=False,
+        drop_dependency_record=True,
+        result_status="SUCCESS",
+    ):
         self.prepare_calls = []
         self.planned_calls = []
         self.copy_ids = []
         self.planning_error = planning_error
         self.interrupt_arm = interrupt_arm
         self.missing_provider_metadata = missing_provider_metadata
+        self.drop_dependency_record = drop_dependency_record
+        self.result_status = result_status
 
     def _snapshot(self, context, **kwargs):
         if self.missing_provider_metadata:
@@ -202,7 +349,11 @@ class FakeOrchestrator:
         return SimpleNamespace(
             final_answer="Answer with evidence and source references.",
             execution_id=context.execution_id,
-            status="SUCCESS",
+            status=(
+                self.result_status.get(accounting_context.treatment_id, "SUCCESS")
+                if isinstance(self.result_status, dict)
+                else self.result_status
+            ),
             duration_seconds=0.2,
             token_usage={},
             error=None,
@@ -216,17 +367,31 @@ class FakeOrchestrator:
             },
             accounting=self._snapshot(
                 context,
-                dropped=int(accounting_context.treatment_id == "DEPENDENCY_AWARE"),
+                dropped=int(
+                    self.drop_dependency_record
+                    and accounting_context.treatment_id == "DEPENDENCY_AWARE"
+                ),
             ),
         )
 
 
 class FakeMedhaRunner:
-    def __init__(self, *, config=None, planning_error=None, interrupt_arm=None, missing_provider_metadata=False):
+    def __init__(
+        self,
+        *,
+        config=None,
+        planning_error=None,
+        interrupt_arm=None,
+        missing_provider_metadata=False,
+        drop_dependency_record=True,
+        result_status="SUCCESS",
+    ):
         self.orchestrator = FakeOrchestrator(
             planning_error=planning_error,
             interrupt_arm=interrupt_arm,
             missing_provider_metadata=missing_provider_metadata,
+            drop_dependency_record=drop_dependency_record,
+            result_status=result_status,
         )
         self.config = config or _configuration()
 
@@ -257,7 +422,7 @@ def test_williams_sequences_balance_positions_and_directed_carryovers():
     assert len(set(carryovers)) == 12
 
 
-def test_smoke_fixture_operational_aggregates_include_incompatible_attempts():
+def test_smoke_fixture_operational_aggregates_include_incompatible_attempts(tmp_path):
     fixture_path = Path(__file__).parent / "fixtures" / "four_arm_smoke_minimal.json"
     fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
     trials = []
@@ -300,6 +465,8 @@ def test_smoke_fixture_operational_aggregates_include_incompatible_attempts():
                 "estimated_tokens_without_usage": item["estimated_total_tokens"],
                 "accounted_total_tokens": item["total_tokens"],
                 "usage_source": item["usage_source"],
+                "total_requests": item["provider_request_count"],
+                "failed_requests": item["failed_provider_request_count"],
             },
             provider_calls=provider_calls,
         )
@@ -407,6 +574,17 @@ def test_smoke_fixture_operational_aggregates_include_incompatible_attempts():
     assert legacy["INDEPENDENT_PARALLEL"]["failure_or_interruption_count"] == 1
     assert operational["BASELINE"]["trial_execution_cost"]["amount_usd"] is None
     assert operational["BASELINE"]["trial_execution_cost"]["unknown_cost_count"] == 1
+    csv_path = tmp_path / "smoke-operational.csv"
+    FourArmBenchmark._write_csv(csv_path, experiment)
+    csv_rows = list(csv.DictReader(csv_path.open(encoding="utf-8", newline="")))
+    assert sum(int(row["provider_request_count"]) for row in csv_rows) == sum(
+        item["provider_request_count"] for item in fixture["trials"]
+    ) == sum(arm["provider_request_count"]["value"] for arm in operational.values())
+    assert sum(int(row["failed_provider_request_count"]) for row in csv_rows) == sum(
+        item["failed_provider_request_count"] for item in fixture["trials"]
+    ) == sum(arm["failed_provider_request_count"]["value"] for arm in operational.values())
+    assert all(row["trial_execution_cost_usd"] == "null" for row in csv_rows)
+    assert all(row["compatibility_status"] == "INCOMPATIBLE" for row in csv_rows)
 
 
 @pytest.mark.parametrize("usage_source", ["estimated", "mixed"])
@@ -450,6 +628,243 @@ def test_missing_model_revision_and_sdk_default_timeout_are_nonblocking_limitati
     assert assessments["plan_preparation_for_baseline"]["status"] == "not_applicable"
     assert any("mutable aliases" in item for item in limitations)
     assert any("provider-managed" in item for item in limitations)
+
+
+def _stage_profiles(
+    *,
+    specialist_temperature=0.2,
+    specialist_temperatures=None,
+    reviewer_temperatures=None,
+    specialist_timeouts=None,
+    deliberation_timeout_source="explicit_request",
+):
+    specialist_temperatures = specialist_temperatures or {}
+    reviewer_temperatures = reviewer_temperatures or {}
+    specialist_timeouts = specialist_timeouts or {}
+    profiles = {
+        "BASELINE": [{"stage": "baseline", "temperature": 0.2}],
+    }
+    for arm in ("INDEPENDENT_PARALLEL", "DEPENDENCY_AWARE", "FULL_MEDHA"):
+        profiles[arm] = [
+            {
+                "stage": "specialist_execution",
+                "temperature": specialist_temperature if arm not in specialist_temperatures else specialist_temperatures[arm],
+                "timeout_source": specialist_timeouts.get(arm, "provider_sdk_default"),
+            },
+            {
+                "stage": "verification",
+                "temperature": reviewer_temperatures.get(arm, 0.1),
+            },
+            {"stage": "synthesis", "temperature": 0.2},
+        ]
+    profiles["FULL_MEDHA"].append({
+        "stage": "deliberation",
+        "temperature": 0.2,
+        "timeout_source": deliberation_timeout_source,
+        "timeout_seconds": 12.0 if deliberation_timeout_source == "explicit_request" else None,
+    })
+    return profiles
+
+
+def test_stage_compatibility_accepts_shared_reviewer_specialist_and_synthesis_settings():
+    experiment = _compatibility_experiment(_stage_profiles())
+
+    FourArmBenchmark._apply_effective_configuration_compatibility(experiment, {})
+
+    assert all(snapshot.compatible for snapshot in experiment.configuration_snapshots.values())
+    assert experiment.configuration_snapshots["BASELINE"].compatibility_assessments[
+        "stage.verification"
+    ]["status"] == "known_equal"
+    deliberation = experiment.configuration_snapshots["BASELINE"].compatibility_assessments[
+        "stage.deliberation"
+    ]
+    assert deliberation["status"] == "treatment_specific"
+    assert deliberation["INDEPENDENT_PARALLEL"] == "not_applicable"
+    assert deliberation["DEPENDENCY_AWARE"] == "not_applicable"
+
+
+@pytest.mark.parametrize(
+    ("stage", "profiles", "difference_key"),
+    [
+        (
+            "verification",
+            _stage_profiles(reviewer_temperatures={"DEPENDENCY_AWARE": 0.2}),
+            "verification",
+        ),
+        (
+            "specialist_execution",
+            _stage_profiles(specialist_temperatures={"FULL_MEDHA": 0.4}),
+            "specialist_execution",
+        ),
+    ],
+)
+def test_shared_stage_temperature_mismatch_is_incompatible(stage, profiles, difference_key):
+    experiment = _compatibility_experiment(profiles)
+
+    FourArmBenchmark._apply_effective_configuration_compatibility(experiment, {})
+
+    snapshot = experiment.configuration_snapshots["BASELINE"]
+    assert snapshot.compatible is False
+    assert snapshot.compatibility_status == "INCOMPATIBLE"
+    assert difference_key in snapshot.compatibility_differences["shared_stage_provider_call_profiles"]
+
+
+def test_shared_stage_token_limit_mismatch_is_incompatible():
+    profiles = _stage_profiles()
+    profiles["DEPENDENCY_AWARE"][0]["output_token_limit"] = 80
+    experiment = _compatibility_experiment(profiles)
+
+    FourArmBenchmark._apply_effective_configuration_compatibility(experiment, {})
+
+    assert experiment.configuration_snapshots["BASELINE"].compatible is False
+    assert "specialist_execution" in experiment.configuration_snapshots[
+        "BASELINE"
+    ].compatibility_differences["shared_stage_provider_call_profiles"]
+
+
+def test_synthesis_temperature_mismatch_is_incompatible():
+    profiles = _stage_profiles()
+    profiles["FULL_MEDHA"][2]["temperature"] = 0.4
+    experiment = _compatibility_experiment(profiles)
+
+    FourArmBenchmark._apply_effective_configuration_compatibility(experiment, {})
+
+    assert experiment.configuration_snapshots["BASELINE"].compatibility_status == "INCOMPATIBLE"
+    assert "synthesis" in experiment.configuration_snapshots[
+        "BASELINE"
+    ].compatibility_differences["shared_stage_provider_call_profiles"]
+
+
+def test_input_token_limit_mismatch_is_incompatible():
+    profiles = _stage_profiles()
+    profiles["DEPENDENCY_AWARE"][0]["input_token_limit"] = 900
+    experiment = _compatibility_experiment(profiles)
+
+    FourArmBenchmark._apply_effective_configuration_compatibility(experiment, {})
+
+    assert experiment.configuration_snapshots["BASELINE"].compatibility_status == "INCOMPATIBLE"
+    assert "specialist_execution" in experiment.configuration_snapshots[
+        "BASELINE"
+    ].compatibility_differences["shared_stage_provider_call_profiles"]
+
+
+def test_common_stage_seen_in_only_one_planned_arm_is_unavailable():
+    profiles = _stage_profiles()
+    profiles["DEPENDENCY_AWARE"] = [item for item in profiles["DEPENDENCY_AWARE"] if item["stage"] != "verification"]
+    profiles["FULL_MEDHA"] = [item for item in profiles["FULL_MEDHA"] if item["stage"] != "verification"]
+    experiment = _compatibility_experiment(profiles)
+
+    FourArmBenchmark._apply_effective_configuration_compatibility(experiment, {})
+
+    snapshot = experiment.configuration_snapshots["BASELINE"]
+    assert snapshot.compatibility_status == "INDETERMINATE"
+    assert snapshot.compatibility_assessments["stage.verification"]["status"] == "unavailable"
+
+
+def test_common_stage_timeout_mismatch_is_incompatible_but_d_only_timeout_is_not():
+    valid = _compatibility_experiment(_stage_profiles())
+    FourArmBenchmark._apply_effective_configuration_compatibility(valid, {})
+    assert all(snapshot.compatible for snapshot in valid.configuration_snapshots.values())
+
+    profiles = _stage_profiles(specialist_timeouts={"DEPENDENCY_AWARE": "explicit_request"})
+    profiles["DEPENDENCY_AWARE"][0]["timeout_seconds"] = 18.0
+    mismatched = _compatibility_experiment(profiles)
+    FourArmBenchmark._apply_effective_configuration_compatibility(mismatched, {})
+    assert mismatched.configuration_snapshots["BASELINE"].compatible is False
+    assert "specialist_execution" in mismatched.configuration_snapshots[
+        "BASELINE"
+    ].compatibility_differences["shared_stage_provider_call_profiles"]
+
+
+def test_missing_d_only_deliberation_timeout_is_reported_as_limitation():
+    experiment = _compatibility_experiment(
+        _stage_profiles(deliberation_timeout_source="unavailable")
+    )
+
+    FourArmBenchmark._apply_effective_configuration_compatibility(experiment, {})
+
+    snapshot = experiment.configuration_snapshots["BASELINE"]
+    assert snapshot.compatibility_assessments["stage.deliberation"]["status"] == "treatment_specific"
+    assert snapshot.compatibility_status == "INDETERMINATE"
+    assert any("FULL_MEDHA.deliberation" in item for item in snapshot.compatibility_limitations)
+
+
+def test_missing_stage_metadata_is_indeterminate_not_equal():
+    profiles = _stage_profiles()
+    profiles["FULL_MEDHA"][0]["stage"] = None
+    experiment = _compatibility_experiment(profiles)
+
+    FourArmBenchmark._apply_effective_configuration_compatibility(experiment, {})
+
+    snapshot = experiment.configuration_snapshots["BASELINE"]
+    assert snapshot.compatible is False
+    assert snapshot.compatibility_status == "INDETERMINATE"
+    assert snapshot.compatibility_assessments["FULL_MEDHA.provider_call_stage"]["status"] == "unavailable"
+
+
+@pytest.mark.parametrize("retained_mismatch", [False, True])
+def test_dropped_call_records_block_comparability_and_preserve_known_mismatches(retained_mismatch):
+    profiles = _stage_profiles()
+    if retained_mismatch:
+        profiles["FULL_MEDHA"][0]["temperature"] = 0.4
+    experiment = _compatibility_experiment(
+        profiles,
+        dropped_by_arm={"DEPENDENCY_AWARE": 1},
+    )
+
+    FourArmBenchmark._apply_effective_configuration_compatibility(experiment, {})
+
+    snapshot = experiment.configuration_snapshots["BASELINE"]
+    assert snapshot.compatible is False
+    assert snapshot.compatibility_assessments[
+        "DEPENDENCY_AWARE.effective_provider_calls"
+    ]["status"] == "unavailable"
+    assert snapshot.compatibility_assessments[
+        "DEPENDENCY_AWARE.effective_provider_calls"
+    ]["dropped_record_count"] == 1
+    _, comparative, _ = FourArmBenchmark.__new__(FourArmBenchmark)._aggregate(experiment)
+    assert comparative["DEPENDENCY_AWARE"]["compatible_attempt_count"] == 0
+    assert comparative["DEPENDENCY_AWARE"]["answer_quality_metrics"]["answer_completeness"]["value"] is None
+    if retained_mismatch:
+        assert "shared_stage_provider_call_profiles" in snapshot.compatibility_differences
+
+
+def test_call_records_without_accounting_snapshot_are_not_assumed_complete():
+    experiment = _compatibility_experiment(_stage_profiles())
+    for block in experiment.task_blocks:
+        for trial in block.trials:
+            trial.result.accounting = None
+
+    FourArmBenchmark._apply_effective_configuration_compatibility(experiment, {})
+
+    snapshot = experiment.configuration_snapshots["BASELINE"]
+    assert snapshot.compatible is False
+    assert snapshot.compatibility_status == "INDETERMINATE"
+    assert snapshot.compatibility_assessments[
+        "BASELINE.effective_provider_calls"
+    ]["reason"] == "accounting snapshot/drop counter unavailable"
+
+
+def test_missing_planning_snapshot_is_indeterminate():
+    experiment = _compatibility_experiment(_stage_profiles())
+    experiment.task_blocks[0].plan_preparation_accounting = None
+
+    FourArmBenchmark._apply_effective_configuration_compatibility(experiment, {})
+
+    snapshot = experiment.configuration_snapshots["BASELINE"]
+    assert snapshot.compatible is False
+    assert snapshot.compatibility_status == "INDETERMINATE"
+    assert snapshot.compatibility_assessments["planner.effective_provider_calls"]["status"] == "unavailable"
+
+
+def test_present_planning_snapshot_without_provider_call_is_not_applicable():
+    experiment = _compatibility_experiment(_stage_profiles())
+    experiment.task_blocks[0].plan_preparation_accounting.provider_calls = []
+
+    FourArmBenchmark._apply_effective_configuration_compatibility(experiment, {})
+
+    snapshot = experiment.configuration_snapshots["BASELINE"]
+    assert snapshot.compatibility_assessments["planner.effective_provider_calls"]["status"] == "not_applicable"
 
 
 @pytest.mark.parametrize(
@@ -531,11 +946,11 @@ def test_operational_aggregates_preserve_partial_telemetry_denominators():
     assert operational["attempt_count"] == 2
     assert operational["success_rate"] == 0.5
     assert operational["provider_request_count"] == {
-        "value": 0,
+        "value": None,
         "attempt_count": 2,
-        "available_attempt_count": 1,
-        "missing_count": 1,
-        "missingness_reason": "provider-call records unavailable",
+        "available_attempt_count": 0,
+        "missing_count": 2,
+        "missingness_reason": "request count unavailable from snapshot or complete records",
     }
     assert operational["tokens"]["input_tokens"]["value"] == 9
     assert operational["tokens"]["input_tokens"]["available_attempt_count"] == 1
@@ -546,6 +961,175 @@ def test_operational_aggregates_preserve_partial_telemetry_denominators():
     assert empty["provider_request_count"]["value"] is None
     assert empty["tokens"]["total_tokens"]["value"] is None
     assert empty["latency"]["average_seconds"] is None
+
+
+def test_snapshot_request_and_failure_counts_reconcile_with_csv_when_records_truncated(tmp_path):
+    context = AccountingContext(
+        experiment_id="truncated-counts",
+        task_block_id="block-1",
+        trial_id="truncated-trial",
+        treatment_id="BASELINE",
+        execution_id="exec-truncated",
+        scope_kind="trial_execution",
+    )
+    retained_call = ProviderCallRecord(
+        attempt_number=1,
+        provider="groq",
+        model="mock-model",
+        temperature=0.2,
+        input_token_limit=1000,
+        output_token_limit=100,
+        status=ProviderCallStatus.FAILED,
+    )
+    accounting = AccountingSnapshot(
+        context=context,
+        duration_seconds=1.0,
+        token_usage={
+            "prompt_tokens": 9,
+            "candidate_tokens": 3,
+            "total_tokens": 12,
+            "accounted_total_tokens": 12,
+            "usage_source": "provider",
+            "total_requests": 5,
+            "failed_requests": 2,
+        },
+        provider_calls=[retained_call],
+        dropped_provider_call_records=4,
+    )
+    result = BenchmarkArmResult(
+        experiment_id="truncated-counts",
+        task_block_id="block-1",
+        trial_id=context.trial_id,
+        execution_id=context.execution_id,
+        arm_id="BASELINE",
+        task_id="case",
+        repetition=1,
+        start_timestamp="start",
+        end_timestamp="end",
+        duration_seconds=1.0,
+        status="FAILED",
+        success=False,
+        quality_eligible=False,
+        execution_metrics={"provider_request_count": 5.0, "provider_failure_count": 2.0},
+        operational_telemetry=FourArmBenchmark._provider_request_counts(
+            accounting,
+            [retained_call],
+            dropped_records=4,
+        ),
+        provider_call_records=[retained_call],
+        accounting=accounting,
+        dropped_provider_call_records=4,
+        trial_execution_cost={"amount_usd": None, "status": "unknown"},
+        end_to_end_cost={"amount_usd": None, "status": "unknown"},
+        configuration=BenchmarkConfigurationSnapshot(
+            compatible=False,
+            compatibility_status="INDETERMINATE",
+            compatibility_limitations=["4 provider-call records dropped"],
+        ),
+    )
+    trial = BenchmarkTrial(
+        trial_id=result.trial_id,
+        task_block_id=result.task_block_id,
+        repetition=1,
+        arm_id=result.arm_id,
+        planned_order=["BASELINE"],
+        actual_order=["BASELINE"],
+        result=result,
+    )
+    experiment = BenchmarkExperiment(
+        experiment_id="truncated-counts",
+        created_at="now",
+        repetitions=1,
+        task_blocks=[BenchmarkTaskBlock(
+            task_block_id="block-1",
+            task_id="case",
+            task_text="synthetic",
+            trials=[trial],
+        )],
+    )
+
+    operational = FourArmBenchmark._aggregate_operational([result])
+    csv_path = tmp_path / "truncated.csv"
+    FourArmBenchmark._write_csv(csv_path, experiment)
+    row = next(csv.DictReader(csv_path.open(encoding="utf-8", newline="")))
+
+    assert result.operational_telemetry["total_requests"] == 5
+    assert result.operational_telemetry["failed_requests"] == 2
+    assert operational["provider_request_count"]["value"] == 5
+    assert operational["failed_provider_request_count"]["value"] == 2
+    assert row["provider_request_count"] == "5"
+    assert row["failed_provider_request_count"] == "2"
+    assert row["provider_failure_count"] == "2"
+    assert row["retry_counts_are_lower_bounds"] == "True"
+    assert row["compatibility_status"] == "INDETERMINATE"
+    assert "dropped" in row["compatibility_exclusion_reason"].lower()
+    assert row["end_to_end_cost_usd"] == "null"
+
+
+def test_pooled_verification_rate_differs_from_trial_mean_and_excludes_unreviewed():
+    shared = {
+        "experiment_id": "pooled-verification",
+        "task_block_id": "block-1",
+        "arm_id": "DEPENDENCY_AWARE",
+        "task_id": "synthetic",
+        "repetition": 1,
+        "planned_order": [],
+        "actual_order": [],
+        "start_timestamp": "start",
+        "end_timestamp": "end",
+        "duration_seconds": 1.0,
+        "status": "SUCCESS",
+        "success": True,
+        "quality_eligible": True,
+        "configuration": BenchmarkConfigurationSnapshot(compatible=True),
+    }
+    trials = []
+    for trial_id, accepted, rejected, unreviewed in (
+        ("one-claim", 1, 0, 0),
+        ("nine-claims", 0, 9, 7),
+    ):
+        reviewed = accepted + rejected
+        rate = accepted / reviewed * 100
+        result = BenchmarkArmResult(
+            **shared,
+            trial_id=trial_id,
+            execution_id=f"exec-{trial_id}",
+            metrics={
+                "verification_support_rate": MetricMeasurement(
+                    value=rate,
+                    eligible_sample_count=1,
+                    attempt_count=1,
+                ),
+                "answer_completeness": MetricMeasurement(
+                    value=1.0,
+                    eligible_sample_count=1,
+                    attempt_count=1,
+                ),
+            },
+            verification_metrics={
+                "support_rate": rate,
+                "accepted_claims_count": accepted,
+                "rejected_claims_count": rejected,
+                "needs_revision_claims_count": 0,
+                "unverifiable_claims_count": 0,
+                "unreviewed_claims_count": unreviewed,
+                "reviewed_claim_count": reviewed,
+            },
+        )
+        trials.append(result)
+
+    comparative = FourArmBenchmark._aggregate_comparative(
+        trials,
+        trials,
+        BenchmarkArm.DEPENDENCY_AWARE,
+    )
+
+    verification = comparative["verification_aggregation"]
+    assert verification["mean_trial_rates"]["support_rate"] == 50.0
+    assert verification["mean_trial_denominators"]["support_rate"] == 2
+    assert verification["pooled_claim_level"]["reviewed_claim_denominator"] == 10
+    assert verification["pooled_claim_level"]["support_rate"] == 10.0
+    assert verification["pooled_claim_level"]["unreviewed_claims"] == 7
 
 
 @pytest.mark.asyncio
@@ -725,6 +1309,9 @@ async def test_configuration_mismatch_is_preserved_but_not_aggregated(tmp_path):
     assert result.aggregate_results["BASELINE"]["incompatible_attempt_count"] == 1
     assert result.aggregate_results["BASELINE"]["success_rate"] == 1.0
     assert result.comparative_aggregates["BASELINE"]["success_rate"] is None
+    assert result.aggregate_results["BASELINE"]["operational"]["success_rate"] == 1.0
+    assert result.aggregate_results["BASELINE"]["comparative"]["success_rate"] is None
+    assert "Operational rate" in result.aggregate_results["BASELINE"]["legacy_field_semantics"]["success_rate"]
     assert result.aggregate_results["FULL_MEDHA"]["incompatible_attempt_count"] == 1
 
 
@@ -740,7 +1327,11 @@ async def test_unavailable_revision_and_default_timeout_are_nonblocking_in_final
     evaluator = BenchmarkEvaluator(
         dataset_path=dataset_path,
         baseline_runner=FakeBaseline(config=config, missing_provider_metadata=True),
-        medha_runner=FakeMedhaRunner(config=config, missing_provider_metadata=True),
+        medha_runner=FakeMedhaRunner(
+            config=config,
+            missing_provider_metadata=True,
+            drop_dependency_record=False,
+        ),
     )
 
     result = await evaluator.run_experiment(
@@ -773,7 +1364,7 @@ async def test_effective_provider_configuration_mismatch_is_detected(tmp_path):
     )
 
     differences = result.experiment.configuration_snapshots["BASELINE"].compatibility_differences
-    assert differences["BASELINE.effective_call.model"] == {
+    assert differences["BASELINE.baseline.model"] == {
         "configured": "mock-model",
         "effective": "unexpected-model",
     }
@@ -816,6 +1407,75 @@ async def test_interruption_preserves_completed_trials_and_does_not_run_later_ar
     assert [trial["arm_id"] for trial in persisted_trials] == [
         "BASELINE", "INDEPENDENT_PARALLEL", "FULL_MEDHA"
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "expected_success"),
+    [
+        ("SUCCESS", True),
+        ("PARTIAL_FAILURE", False),
+        ("FAILED", False),
+        ("TIMED_OUT", False),
+        ("CANCELLED", False),
+        ("INTERRUPTED", False),
+    ],
+)
+async def test_trial_terminal_statuses_are_preserved_and_timeout_is_counted(
+    tmp_path,
+    status,
+    expected_success,
+):
+    dataset_path = tmp_path / "cases.json"
+    dataset_path.write_text('[{"id":"terminal-status","prompt":"Task"}]', encoding="utf-8")
+    evaluator = BenchmarkEvaluator(
+        dataset_path=dataset_path,
+        baseline_runner=FakeBaseline(),
+        medha_runner=FakeMedhaRunner(result_status={"FULL_MEDHA": status}),
+    )
+
+    result = await evaluator.run_experiment(
+        experiment_id=f"status-{status.lower()}",
+        output_directory=tmp_path / "exports",
+    )
+
+    full_trial = next(
+        trial.result
+        for trial in result.experiment.task_blocks[0].trials
+        if trial.arm_id == "FULL_MEDHA"
+    )
+    assert full_trial.status == status
+    assert full_trial.success is expected_success
+    assert result.operational_aggregates["FULL_MEDHA"]["timed_out_count"] == int(status == "TIMED_OUT")
+    csv_rows = list(csv.DictReader((tmp_path / "exports" / f"status-{status.lower()}.csv").open(
+        encoding="utf-8",
+        newline="",
+    )))
+    row = next(item for item in csv_rows if item["arm_id"] == "FULL_MEDHA")
+    assert row["status"] == status
+    assert row["timed_out_count"] == str(int(status == "TIMED_OUT"))
+
+
+@pytest.mark.asyncio
+async def test_baseline_sanitized_timeout_error_is_reported_as_timed_out(tmp_path):
+    dataset_path = tmp_path / "cases.json"
+    dataset_path.write_text('[{"id":"baseline-timeout","prompt":"Task"}]', encoding="utf-8")
+    evaluator = BenchmarkEvaluator(
+        dataset_path=dataset_path,
+        baseline_runner=FakeBaseline(success=False, error="LLMTimeoutError (status 408)"),
+        medha_runner=FakeMedhaRunner(),
+    )
+
+    result = await evaluator.run_experiment(
+        experiment_id="baseline-timeout",
+        output_directory=tmp_path / "exports",
+    )
+
+    baseline = result.experiment.task_blocks[0].trials[0].result
+    assert baseline.arm_id == "BASELINE"
+    assert baseline.status == "TIMED_OUT"
+    assert baseline.success is False
+    assert result.operational_aggregates["BASELINE"]["timed_out_count"] == 1
 
 
 @pytest.mark.asyncio

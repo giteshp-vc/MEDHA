@@ -35,7 +35,7 @@ async def test_claim_extractor_from_result():
         claims=["Postgres handles 10,000 writes/sec with sharding", "Redis caching reduces DB read load by 80%"],
         assumptions=["Standard SSD NVMe drives used"],
     )
-    extractor = ClaimExtractor()
+    extractor = ClaimExtractor(llm_client=MagicMock())
     claims = await extractor.extract_claims_from_result(result, task_id="task_123")
 
     assert len(claims) == 2
@@ -302,6 +302,37 @@ async def test_reviewer_does_not_accept_non_factual_claim_categories(claim_kind)
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "claim_text, expected",
+    [
+        ("Unit tests catch regressions early when code is refactored.", VerificationDecision.ACCEPT),
+        ("Unit tests reduce bug-fix time by up to 30% in Python projects.", VerificationDecision.REQUEST_REVISION),
+    ],
+)
+async def test_general_mode_accepts_textbook_claims_but_not_unsourced_numbers(monkeypatch, claim_text, expected):
+    from config import settings
+
+    monkeypatch.setattr(settings, "VERIFICATION_MODE", "general")
+    mock_client = MagicMock()
+    mock_client.aio.models.generate_content = AsyncMock(
+        return_value=_mock_llm_response(
+            '{"reviews":[{"claim_id":"gk_claim","decision":"ACCEPT",'
+            '"reasoning":"General knowledge (not externally evidenced): standard practice.",'
+            '"is_supported_by_evidence":false,"is_evidence_relevant":false,"logically_valid":true}]}'
+        )
+    )
+    claim = Claim(claim_id="gk_claim", claim_text=claim_text, originating_agent="agent_testing")
+    ledger = EvidenceLedger(task_id="general_mode_test")
+    await ledger.register_claim(claim)
+
+    feedback = await AdversarialReviewer(
+        llm_client=GeminiClient(api_key="mock_key", client=mock_client)
+    ).review_claims(ledger=ledger, task_context="Benefits of unit testing")
+
+    assert feedback[0].decision == expected
+
+
+@pytest.mark.asyncio
 async def test_support_rate_calculation_reviewed_vs_unreviewed():
     """Verify support rate excludes unreviewed/pending claims and never divides by zero."""
     ledger = EvidenceLedger(task_id="rate_test", max_claims=30)
@@ -345,6 +376,34 @@ async def test_zero_reviewed_claims_have_undefined_support_rate():
     assert report.unsupported_rate is None
     assert len(report.unreviewed_claims) == 1
     assert "No claims were reviewed" in report.summary_message
+
+
+@pytest.mark.asyncio
+async def test_batch_review_matches_cosmetically_altered_claim_ids_without_recovery():
+    mock_client = MagicMock()
+    mock_client.aio.models.generate_content = AsyncMock(
+        return_value=_mock_llm_response(
+            '{"reviews":['
+            '{"claim_id":" [CLAIM_ABC123] ","decision":"REJECT","reasoning":"Contradicted."},'
+            '{"claim_id":"def456","decision":"REQUEST_REVISION","reasoning":"Unsupported."}]}'
+        )
+    )
+    ledger = EvidenceLedger(task_id="id_drift_test")
+    for claim_id in ("claim_abc123", "claim_def456"):
+        await ledger.register_claim(
+            Claim(claim_id=claim_id, claim_text=f"Claim text for {claim_id} is here.", originating_agent="a1")
+        )
+
+    feedback = await AdversarialReviewer(
+        llm_client=GeminiClient(api_key="mock_key", client=mock_client), batch_size=5
+    ).review_claims(ledger=ledger, task_context="ID drift")
+
+    assert mock_client.aio.models.generate_content.await_count == 1
+    decisions = {fb.claim_id: fb.decision for fb in feedback}
+    assert decisions == {
+        "claim_abc123": VerificationDecision.REJECT,
+        "claim_def456": VerificationDecision.REQUEST_REVISION,
+    }
 
 
 @pytest.mark.asyncio

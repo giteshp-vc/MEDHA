@@ -87,6 +87,7 @@ class BenchmarkArmResult(BaseSchema):
     partial_answer: Optional[str] = None
     metrics: Dict[str, MetricMeasurement] = Field(default_factory=dict)
     execution_metrics: Dict[str, Optional[float]] = Field(default_factory=dict)
+    operational_telemetry: Dict[str, Any] = Field(default_factory=dict)
     verification_metrics: Dict[str, Optional[float]] = Field(default_factory=dict)
     provider_call_records: List[ProviderCallRecord] = Field(default_factory=list)
     accounting: Optional[AccountingSnapshot] = None
@@ -144,9 +145,12 @@ class BenchmarkExperiment(BaseSchema):
     task_blocks: List[BenchmarkTaskBlock] = Field(default_factory=list)
     schedule_policy: str = "deterministic_williams_4_sequence_cycle"
     compatibility_policy: str = (
-        "Reject known configuration differences. Provider-unreported immutable revisions and "
-        "provider-default timeout durations are unavailable non-blocking limitations when the "
-        "requested model identifier and timeout mode otherwise match."
+        "Compare effective settings by normalized execution stage across shared B/C/D stages. "
+        "Reject known common-stage configuration differences. D-only deliberation settings are "
+        "treatment-specific. Missing stages or dropped call records make effective configuration "
+        "indeterminate and exclude comparative aggregates. Provider-unreported immutable revisions "
+        "and provider-default timeout durations remain explicit non-blocking limitations when "
+        "requested common-stage settings otherwise match."
     )
     schedule_sequences_used: List[int] = Field(default_factory=list)
     schedule_cycle_complete: bool = False
@@ -156,6 +160,8 @@ class BenchmarkExperiment(BaseSchema):
         "pitfall_avoidance": "known-pitfall lexical proxy",
         "uncertainty_handling": "language-marker proxy",
         "evidence_quality": "language-marker proxy, not factual verification",
+        "verification_reporting": "unweighted mean of eligible trial rates plus pooled reviewed-claim rate",
+        "unreviewed_claims_in_pooled_denominator": False,
         "factual_correctness": None,
         "human_scoring": "not supplied; no blinded human score is fabricated",
         "agent_agreement_is_evidence": False,
@@ -164,7 +170,8 @@ class BenchmarkExperiment(BaseSchema):
     resource_accounting_policy: str = (
         "AccountingSnapshot is authoritative for token usage and total/failed request counters; "
         "provider-call records provide retry/fallback attribution and per-call configuration/status, "
-        "with dropped-record counts exposing telemetry lower bounds."
+        "with dropped-record counts exposing telemetry lower bounds. CSV request counters also use "
+        "snapshot counters; retry/fallback counts are lower bounds when records were dropped."
     )
     statistical_significance_claimed: bool = False
 

@@ -1,7 +1,9 @@
 import asyncio
+import re
 from typing import Any, Dict, List, Optional
 
 from agents.reviewer_agent import ReviewerAgent
+from config import settings
 from config.settings import REVIEW_BATCH_SIZE
 from core.llm_client import BaseLLMClient, LLMClient
 from models.schemas import ClaimKind, ClaimStatus, VerificationDecision
@@ -11,6 +13,8 @@ from verification.claim_validator import ClaimValidator
 from verification.evidence_ledger import EvidenceLedger
 
 logger = get_logger("adversarial_reviewer")
+
+NUMERIC_CLAIM_PATTERN = re.compile(r"\d")
 
 
 class AdversarialReviewer:
@@ -105,6 +109,21 @@ class AdversarialReviewer:
                     feedback.suggested_fix = (
                         (feedback.suggested_fix or "")
                         + " Keep this explicitly labeled as a target, assumption, or recommendation."
+                    )
+
+                if (
+                    feedback.decision == VerificationDecision.ACCEPT
+                    and settings.VERIFICATION_MODE == "general"
+                    and not ev_items
+                    and NUMERIC_CLAIM_PATTERN.search(claim.claim_text)
+                ):
+                    feedback.decision = VerificationDecision.REQUEST_REVISION
+                    feedback.reasoning += (
+                        " [Heuristic Flag: numeric or quantitative claims need registered evidence even in general mode.]"
+                    )
+                    feedback.suggested_fix = (
+                        (feedback.suggested_fix or "")
+                        + " Remove unsupported figures or provide a source for them."
                     )
 
                 # Map decision to ClaimStatus

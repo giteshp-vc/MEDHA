@@ -25,6 +25,54 @@ from utils.retry import (
 from utils.token_tracker import TokenTracker
 
 
+def test_groq_per_minute_limit_with_billing_link_is_retryable():
+    from utils.retry import classify_error
+
+    err = RuntimeError(
+        "Error code: 429 - Rate limit reached for model `m` on tokens per minute (TPM): Limit 8000, "
+        "Used 5581, Requested 2613. Please try again in 1.455s. Need more tokens? Upgrade to Dev Tier "
+        "today at https://console.groq.com/settings/billing"
+    )
+    retryable, classified = classify_error(err)
+    assert retryable is True
+    assert isinstance(classified, LLMRateLimitError)
+    assert classified.retry_after == pytest.approx(1.455)
+
+
+def test_daily_token_limit_remains_quota_exhaustion():
+    from utils.retry import classify_error
+
+    err = RuntimeError("Error code: 429 - Rate limit reached on tokens per day (TPD): Limit 500000")
+    retryable, classified = classify_error(err)
+    assert retryable is False
+    assert isinstance(classified, LLMQuotaExhaustedError)
+
+
+def test_reviewer_instruction_follows_verification_mode(monkeypatch):
+    from agents.reviewer_agent import (
+        GENERAL_KNOWLEDGE_ADDENDUM,
+        REVIEWER_SYSTEM_INSTRUCTION,
+        reviewer_system_instruction,
+    )
+    from config import settings
+
+    monkeypatch.setattr(settings, "VERIFICATION_MODE", "strict")
+    assert reviewer_system_instruction() == REVIEWER_SYSTEM_INSTRUCTION
+    monkeypatch.setattr(settings, "VERIFICATION_MODE", "general")
+    assert reviewer_system_instruction().endswith(GENERAL_KNOWLEDGE_ADDENDUM)
+
+
+def test_benchmark_refuses_general_verification_mode(monkeypatch):
+    import main
+    from config import settings
+
+    monkeypatch.setattr(main, "validate_settings", lambda: True)
+    monkeypatch.setattr(settings, "VERIFICATION_MODE", "general")
+    with pytest.raises(SystemExit) as exit_info:
+        asyncio.run(main.run_benchmark_cli())
+    assert exit_info.value.code == 2
+
+
 class SampleOutput(BaseModel):
     title: str
     score: int

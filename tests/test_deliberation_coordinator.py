@@ -204,6 +204,20 @@ async def test_prompt_includes_source_and_target_evidence_references():
 
 
 @pytest.mark.asyncio
+async def test_prompt_states_expected_sender_and_recipient_ids():
+    trigger = make_trigger()
+    client = MagicMock()
+    client.generate_structured = AsyncMock(return_value=make_response(trigger))
+    coordinator, _, _, _, _ = make_coordinator(client, StaticPolicy([trigger]))
+
+    await coordinator.run()
+
+    prompt = client.generate_structured.await_args.kwargs["prompt"]
+    assert f"use as sender_agent_id): {trigger.target_agent_id}" in prompt
+    assert f"use as recipient_agent_id): {trigger.source_agent_id}" in prompt
+
+
+@pytest.mark.asyncio
 async def test_invalid_response_identity_is_rejected():
     trigger = make_trigger()
     client = MagicMock()
