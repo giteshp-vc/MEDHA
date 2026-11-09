@@ -489,7 +489,7 @@ async def test_token_budget_exhaustion_prevents_provider_dispatch():
     async with tracker.task_budget():
         with tracker.operation("specialist"):
             with pytest.raises(LLMTokenBudgetExceededError, match="Local task token budget"):
-                await client.generate_text("A small prompt")
+                await client.generate_text("A small prompt", max_tokens=2048)
         summary = await tracker.get_summary()
 
     assert mock_client.aio.models.generate_content.call_count == 0
@@ -577,7 +577,7 @@ async def test_gemini_response_without_usage_metadata_preserves_local_estimate()
 
     async with tracker.task_budget():
         with tracker.operation("specialist"):
-            assert await client.generate_text("Short prompt") == "Response without usage"
+            assert await client.generate_text("Short prompt", max_tokens=2048) == "Response without usage"
         summary = await tracker.get_summary()
 
     budget = summary["local_task_token_budget"]

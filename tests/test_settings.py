@@ -21,7 +21,7 @@ def test_settings_load_defaults():
     assert settings.MAX_EXCHANGES_PER_CLAIM == 2
     assert settings.MAX_DELIBERATION_MESSAGES == 30
     assert settings.MAX_DELIBERATION_MESSAGES_PER_AGENT == 8
-    assert settings.MAX_DELIBERATION_TOKENS == 4096
+    assert settings.MAX_DELIBERATION_TOKENS == 8192
     assert settings.DELIBERATION_TIMEOUT_SECONDS == 90.0
 
 
