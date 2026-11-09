@@ -208,6 +208,17 @@ def classify_error(exc: Exception) -> Tuple[bool, LLMError]:
     if "timeout" in exc_name:
         return True, LLMTimeoutError(f"Network timeout: {exc}")
 
+    # Transport failures (e.g. groq.APIConnectionError, httpx.ConnectError) never reached the model.
+    lower_text = str(exc).lower()
+    if (
+        "connection" in exc_name
+        or exc_name in ("connecterror", "readerror", "writeerror", "remoteprotocolerror", "networkerror")
+        or "connection error" in lower_text
+        or "connection reset" in lower_text
+        or "connection aborted" in lower_text
+    ):
+        return True, LLMServerError(f"Network connection error (retryable): {exc}", status_code=503)
+
     code = extract_status_code(exc)
     retry_after = extract_retry_after(exc)
     msg = str(exc)

@@ -49,7 +49,7 @@ MAX_INPUT_TOKENS_PER_CALL = int(os.getenv("MAX_INPUT_TOKENS_PER_CALL", "12000"))
 MAX_TOKENS_PER_TASK = int(os.getenv("MAX_TOKENS_PER_TASK", "50000"))
 CLAIM_EXTRACTION_TOKEN_RESERVE = int(os.getenv("CLAIM_EXTRACTION_TOKEN_RESERVE", "4096"))
 VERIFICATION_TOKEN_RESERVE = int(os.getenv("VERIFICATION_TOKEN_RESERVE", "12288"))
-SYNTHESIS_TOKEN_RESERVE = int(os.getenv("SYNTHESIS_TOKEN_RESERVE", "4096"))
+SYNTHESIS_TOKEN_RESERVE = int(os.getenv("SYNTHESIS_TOKEN_RESERVE", "12288"))
 
 # 'strict' requires registered evidence; 'general' also accepts well-established textbook knowledge.
 VERIFICATION_MODE = os.getenv("VERIFICATION_MODE", "strict").strip().lower()

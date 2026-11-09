@@ -39,6 +39,22 @@ def test_groq_per_minute_limit_with_billing_link_is_retryable():
     assert classified.retry_after == pytest.approx(1.455)
 
 
+class APIConnectionError(Exception):
+    pass
+
+
+@pytest.mark.parametrize(
+    "error",
+    [APIConnectionError("Connection error."), RuntimeError("Connection reset by peer")],
+)
+def test_network_connection_errors_are_retryable(error):
+    from utils.retry import classify_error
+
+    retryable, classified = classify_error(error)
+    assert retryable is True
+    assert isinstance(classified, LLMServerError)
+
+
 def test_daily_token_limit_remains_quota_exhaustion():
     from utils.retry import classify_error
 
