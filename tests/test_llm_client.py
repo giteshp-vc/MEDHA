@@ -55,6 +55,30 @@ def test_network_connection_errors_are_retryable(error):
     assert isinstance(classified, LLMServerError)
 
 
+def test_request_too_large_is_not_retried():
+    from utils.retry import classify_error
+
+    err = RuntimeError(
+        "Error code: 413 - Request too large for model `m` on tokens per minute (TPM): Limit 8000, "
+        "Requested 8151, please reduce your message size and try again."
+    )
+    retryable, classified = classify_error(err)
+    assert retryable is False
+    assert isinstance(classified, LLMClientError)
+    assert classified.status_code == 413
+
+
+@pytest.mark.parametrize(
+    "tpm, input_tokens, requested, expected",
+    [(0, 5000, 4096, 4096), (8000, 4000, 4096, 3200), (8000, 1000, 2048, 2048), (8000, 7900, 4096, 256), (8000, 7900, 48, 48)],
+)
+def test_groq_output_limit_fits_provider_tpm(monkeypatch, tpm, input_tokens, requested, expected):
+    import core.providers.groq_client as groq_module
+
+    monkeypatch.setattr(groq_module, "PROVIDER_TOKENS_PER_MINUTE", tpm)
+    assert GroqClient._fit_output_limit(input_tokens, requested) == expected
+
+
 def test_daily_token_limit_remains_quota_exhaustion():
     from utils.retry import classify_error
 

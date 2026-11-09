@@ -219,6 +219,10 @@ def classify_error(exc: Exception) -> Tuple[bool, LLMError]:
     ):
         return True, LLMServerError(f"Network connection error (retryable): {exc}", status_code=503)
 
+    # A single request above the provider's per-minute cap can never succeed, so retrying wastes budget.
+    if extract_status_code(exc) == 413 or "request too large" in lower_text:
+        return False, LLMClientError(f"Request too large for provider limits (413): {exc}", status_code=413)
+
     code = extract_status_code(exc)
     retry_after = extract_retry_after(exc)
     msg = str(exc)

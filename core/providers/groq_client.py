@@ -12,6 +12,7 @@ from config.settings import (
     MAX_RETRIES,
     MAX_RETRY_DELAY,
     PROVIDER_REQUEST_TIMEOUT_SECONDS,
+    PROVIDER_TOKENS_PER_MINUTE,
     TEMPERATURE,
     validate_settings,
 )
@@ -82,6 +83,15 @@ class GroqClient(BaseLLMClient):
                 raise LLMClientError("GROQ_API_KEY is not configured.", status_code=401)
             self._client = AsyncGroq(api_key=self.api_key)
         return self._client
+
+    @staticmethod
+    def _fit_output_limit(estimated_input_tokens: int, output_limit: int) -> int:
+        """Shrink the output limit so input + output stays under the provider's per-minute token cap."""
+        if PROVIDER_TOKENS_PER_MINUTE <= 0:
+            return output_limit
+        # Local estimates can undercount the provider tokenizer; keep a 10% safety margin.
+        headroom = int(PROVIDER_TOKENS_PER_MINUTE * 0.9) - estimated_input_tokens
+        return min(output_limit, max(256, headroom))
 
     @staticmethod
     def _is_unsupported_format_error(err: Exception) -> bool:
@@ -187,6 +197,7 @@ class GroqClient(BaseLLMClient):
         estimated_input_tokens = self.token_tracker.estimate_tokens(
             "\n".join(message["content"] for message in messages)
         )
+        output_limit = self._fit_output_limit(estimated_input_tokens, output_limit)
         retry_attempt = 0
         wire_attempt = 0
         attempt_recorders: Dict[int, List[Any]] = {}
@@ -279,6 +290,7 @@ class GroqClient(BaseLLMClient):
         estimated_input_tokens = self.token_tracker.estimate_tokens(
             "\n".join(message["content"] for message in messages)
         )
+        output_limit = self._fit_output_limit(estimated_input_tokens, output_limit)
         retry_attempt = 0
         wire_attempt = 0
         attempt_recorders: Dict[int, List[Any]] = {}

@@ -46,6 +46,8 @@ MAX_REPAIR_CLAIMS_PER_ITERATION = int(os.getenv("MAX_REPAIR_CLAIMS_PER_ITERATION
 MAX_LLM_CALLS_PER_TASK = int(os.getenv("MAX_LLM_CALLS_PER_TASK", "25"))
 MAX_OUTPUT_TOKENS_PER_CALL = int(os.getenv("MAX_OUTPUT_TOKENS_PER_CALL", "2048"))
 MAX_INPUT_TOKENS_PER_CALL = int(os.getenv("MAX_INPUT_TOKENS_PER_CALL", "12000"))
+# Optional provider tokens-per-minute cap (e.g. 8000 on Groq free tier); 0 disables output-limit fitting.
+PROVIDER_TOKENS_PER_MINUTE = int(os.getenv("PROVIDER_TOKENS_PER_MINUTE", "0"))
 MAX_TOKENS_PER_TASK = int(os.getenv("MAX_TOKENS_PER_TASK", "50000"))
 CLAIM_EXTRACTION_TOKEN_RESERVE = int(os.getenv("CLAIM_EXTRACTION_TOKEN_RESERVE", "4096"))
 VERIFICATION_TOKEN_RESERVE = int(os.getenv("VERIFICATION_TOKEN_RESERVE", "12288"))
@@ -129,6 +131,9 @@ def validate_settings() -> bool:
 
     if MAX_INPUT_TOKENS_PER_CALL < 1:
         raise ValueError("MAX_INPUT_TOKENS_PER_CALL must be at least 1.")
+
+    if PROVIDER_TOKENS_PER_MINUTE < 0:
+        raise ValueError("PROVIDER_TOKENS_PER_MINUTE cannot be negative.")
 
     if MAX_TOKENS_PER_TASK < 1:
         raise ValueError("MAX_TOKENS_PER_TASK must be at least 1.")
