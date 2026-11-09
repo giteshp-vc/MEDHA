@@ -62,6 +62,15 @@ def test_reviewer_instruction_follows_verification_mode(monkeypatch):
     assert reviewer_system_instruction().endswith(GENERAL_KNOWLEDGE_ADDENDUM)
 
 
+def test_console_text_replaces_typographic_unicode():
+    import main
+
+    assert main._console_text("needs\u2011revision \u2014 0.0\u202f% \u201cok\u201d \u2265 1\u2026") == (
+        'needs-revision - 0.0 % "ok" >= 1...'
+    )
+    assert main._console_text(None) == ""
+
+
 def test_benchmark_refuses_general_verification_mode(monkeypatch):
     import main
     from config import settings

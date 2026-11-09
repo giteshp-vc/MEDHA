@@ -330,6 +330,37 @@ async def test_general_mode_accepts_textbook_claims_but_not_unsourced_numbers(mo
     ).review_claims(ledger=ledger, task_context="Benefits of unit testing")
 
     assert feedback[0].decision == expected
+    if expected == VerificationDecision.ACCEPT:
+        from agents.reviewer_agent import GENERAL_KNOWLEDGE_PREFIX
+
+        assert feedback[0].reasoning.startswith(GENERAL_KNOWLEDGE_PREFIX)
+        assert feedback[0].reasoning.count(GENERAL_KNOWLEDGE_PREFIX) == 1
+
+
+@pytest.mark.asyncio
+async def test_general_mode_labels_unlabeled_evidence_free_acceptance(monkeypatch):
+    from agents.reviewer_agent import GENERAL_KNOWLEDGE_PREFIX
+    from config import settings
+
+    monkeypatch.setattr(settings, "VERIFICATION_MODE", "general")
+    mock_client = MagicMock()
+    mock_client.aio.models.generate_content = AsyncMock(
+        return_value=_mock_llm_response(
+            '{"reviews":[{"claim_id":"gk2","decision":"ACCEPT","reasoning":"Standard practice."}]}'
+        )
+    )
+    ledger = EvidenceLedger(task_id="gk_label_test")
+    await ledger.register_claim(
+        Claim(claim_id="gk2", claim_text="Tests document expected behaviour of code.", originating_agent="a1")
+    )
+
+    feedback = await AdversarialReviewer(
+        llm_client=GeminiClient(api_key="mock_key", client=mock_client)
+    ).review_claims(ledger=ledger, task_context="Benefits of unit testing")
+
+    assert feedback[0].reasoning == f"{GENERAL_KNOWLEDGE_PREFIX} Standard practice."
+    stored = (await ledger.get_all_claims())[0]
+    assert GENERAL_KNOWLEDGE_PREFIX in stored.reviewer_feedback
 
 
 @pytest.mark.asyncio

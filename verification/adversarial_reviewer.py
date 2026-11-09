@@ -2,7 +2,7 @@ import asyncio
 import re
 from typing import Any, Dict, List, Optional
 
-from agents.reviewer_agent import ReviewerAgent
+from agents.reviewer_agent import GENERAL_KNOWLEDGE_PREFIX, ReviewerAgent
 from config import settings
 from config.settings import REVIEW_BATCH_SIZE
 from core.llm_client import BaseLLMClient, LLMClient
@@ -125,6 +125,14 @@ class AdversarialReviewer:
                         (feedback.suggested_fix or "")
                         + " Remove unsupported figures or provide a source for them."
                     )
+
+                if (
+                    feedback.decision == VerificationDecision.ACCEPT
+                    and settings.VERIFICATION_MODE == "general"
+                    and not ev_items
+                    and GENERAL_KNOWLEDGE_PREFIX not in feedback.reasoning
+                ):
+                    feedback.reasoning = f"{GENERAL_KNOWLEDGE_PREFIX} {feedback.reasoning}"
 
                 # Map decision to ClaimStatus
                 if feedback.decision == VerificationDecision.ACCEPT:

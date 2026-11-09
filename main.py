@@ -23,6 +23,18 @@ BANNER = """
 ======================================================================
 """
 
+# PowerShell 5.1 decodes redirected native output with the OEM code page, garbling typographic Unicode.
+_TYPOGRAPHIC_TO_ASCII = str.maketrans({
+    "\u2010": "-", "\u2011": "-", "\u2012": "-", "\u2013": "-", "\u2014": "-", "\u2015": "-",
+    "\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"',
+    "\u00a0": " ", "\u202f": " ", "\u2009": " ", "\u2026": "...",
+    "\u2264": "<=", "\u2265": ">=", "\u2192": "->", "\u2022": "*",
+})
+
+
+def _console_text(text: Any) -> str:
+    return str(text or "").translate(_TYPOGRAPHIC_TO_ASCII)
+
 
 def _format_rate(val: Any) -> str:
     """Format rate as percentage string, safely handling both fraction (0.0-1.0) and percentage (0.0-100.0)."""
@@ -77,7 +89,7 @@ async def run_interactive_session():
             print("======================================================================")
             print("                         FINAL SYNTHESIS                              ")
             print("======================================================================\n")
-            print(result.final_answer)
+            print(_console_text(result.final_answer))
             print("\n======================================================================")
             print("                       EXECUTION SUMMARY                              ")
             print("======================================================================")
@@ -125,7 +137,7 @@ async def run_single_task(task_text: str):
     orchestrator = MedhaOrchestrator()
     print(f"Executing MEDHA for task: '{task_text}'\n")
     result = await orchestrator.run_task(task_text)
-    print(result.final_answer)
+    print(_console_text(result.final_answer))
     print("\n--- Summary ---")
     print(f"Execution ID: {result.execution_id} | Duration: {result.duration_seconds}s | Status: {result.status}")
     print(f"Support Rate: {_format_rate(result.verification_report.get('support_rate', 0.0))}")
@@ -236,7 +248,7 @@ def main():
         validate_settings()
         baseline = SingleAgentBaseline()
         res = asyncio.run(baseline.run(args.baseline))
-        print(res.answer)
+        print(_console_text(res.answer))
     elif args.task:
         asyncio.run(run_single_task(args.task))
     else:

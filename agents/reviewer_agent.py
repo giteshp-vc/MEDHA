@@ -54,13 +54,15 @@ REVIEWER_SYSTEM_INSTRUCTION = (
     "- UNVERIFIABLE: The claim relies on unknowable external facts or unprovable speculation."
 )
 
+GENERAL_KNOWLEDGE_PREFIX = "General knowledge (not externally evidenced):"
+
 GENERAL_KNOWLEDGE_ADDENDUM = (
     "\n\nGENERAL KNOWLEDGE MODE (enabled by the operator):\n"
     "- You MAY ACCEPT a claim without registered evidence ONLY if it states widely established, "
     "uncontroversial domain knowledge found in standard textbooks or official documentation.\n"
     "- Such a claim must contain no specific numbers, measurements, dates, citations, URLs, benchmarks, "
     "or completed-test results, and must not overstate certainty.\n"
-    "- Begin the 'reasoning' of every such acceptance with 'General knowledge (not externally evidenced):'.\n"
+    f"- Begin the 'reasoning' of every such acceptance with '{GENERAL_KNOWLEDGE_PREFIX}'.\n"
     "- All other rules above still apply; empirical, numeric, recent, or contested claims still require evidence."
 )
 

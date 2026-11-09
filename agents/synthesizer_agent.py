@@ -3,6 +3,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from agents.base_agent import BaseAgent
+from agents.reviewer_agent import GENERAL_KNOWLEDGE_PREFIX
 from models.agent_models import AgentConfig, AgentResponse
 from models.deliberation_models import DeliberationReport
 from models.schemas import AgentStatus, ClaimKind
@@ -55,7 +56,13 @@ class SynthesizerAgent(BaseAgent):
 
         # Format accepted claims
         accepted_text = "\n".join(
-            self._format_claim(c) for c in verification_report.accepted_claims
+            self._format_claim(c)
+            + (
+                " | basis: GENERAL KNOWLEDGE (not externally evidenced)"
+                if GENERAL_KNOWLEDGE_PREFIX in (c.reviewer_feedback or "")
+                else ""
+            )
+            for c in verification_report.accepted_claims
         ) or "None explicitly accepted."
 
         # Format rejected / excluded claims
@@ -106,7 +113,7 @@ class SynthesizerAgent(BaseAgent):
 
         system_instruction = (
             "You are the Lead Synthesizer for MEDHA (Multi-Agent Evidence-Driven Architecture).\n"
-            "Your objective is to craft the definitive, evidence-grounded final answer to the user's task.\n\n"
+            "Your objective is to craft the definitive, verification-aware final answer to the user's task.\n\n"
             "SYNTHESIS GUIDELINES:\n"
             "1. Coherent Integration: Harmonize all validated contributions into an actionable, comprehensive solution.\n"
             "2. Evidence Traceability: Base factual conclusions strictly on ACCEPTED claims. Reference claim IDs where helpful.\n"
@@ -122,8 +129,13 @@ class SynthesizerAgent(BaseAgent):
             "Never present assumptions or proposed metrics as verified experimental measurements.\n"
             "7. Deliberation context is not evidence. Use the independent VerificationReport status for each claim; "
             "present unresolved disagreements separately and never promote consensus.\n"
-            "8. Structure: Use clean Markdown headers (Executive Summary, Architecture/Solution Design, "
-            "Evidence & Verification Audit, Operating Assumptions, Unresolved Edge Cases)."
+            "8. Structure: Start with a '## Direct Answer' section that answers the ORIGINAL USER TASK exactly in the "
+            "format and length it requests (e.g. 'one sentence each', a list, a number); keep it short. Then use clean "
+            "Markdown headers (Evidence & Verification Audit, Operating Assumptions, Unresolved Edge Cases) and add "
+            "Architecture/Solution Design only if the task asks for a design.\n"
+            "9. Accepted claims marked 'basis: GENERAL KNOWLEDGE' were accepted as well-established knowledge without "
+            "external evidence. Describe them as 'accepted as general knowledge', never as evidence-backed, "
+            "evidence-grounded, or independently verified."
         )
 
         prompt = (

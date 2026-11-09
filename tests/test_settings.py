@@ -22,7 +22,7 @@ def test_settings_load_defaults():
     assert settings.MAX_DELIBERATION_MESSAGES == 30
     assert settings.MAX_DELIBERATION_MESSAGES_PER_AGENT == 8
     assert settings.MAX_DELIBERATION_TOKENS == 4096
-    assert settings.DELIBERATION_TIMEOUT_SECONDS == 20.0
+    assert settings.DELIBERATION_TIMEOUT_SECONDS == 90.0
 
 
 def test_validate_settings_rejects_invalid_deliberation_limits(monkeypatch):
