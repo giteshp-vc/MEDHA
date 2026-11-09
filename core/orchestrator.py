@@ -817,6 +817,7 @@ class MedhaOrchestrator:
                 exec_record.metadata["accounting"] = accounting_snapshot.model_dump(mode="json")
 
             # Finalize execution record and save structured log
+            exec_record.metadata["final_answer"] = final_answer
             exec_record.finish(status=execution_status, token_usage=token_summary)
             exec_record.save()
 

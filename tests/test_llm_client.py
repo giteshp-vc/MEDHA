@@ -71,6 +71,21 @@ def test_console_text_replaces_typographic_unicode():
     assert main._console_text(None) == ""
 
 
+def test_console_prints_only_direct_answer_unless_full():
+    import main
+
+    report = (
+        "## Direct Answer\n1. Catches regressions early.\n2. Enables safe refactoring.\n\n---\n\n"
+        "## Evidence & Verification Audit\n- Support rate: 100%\n"
+    )
+    assert main._answer_for_console(report, full=False) == (
+        "1. Catches regressions early.\n2. Enables safe refactoring."
+    )
+    assert "Evidence & Verification Audit" in main._answer_for_console(report, full=True)
+    failure_report = "# Execution Failure Report\n\n### Status: FAILED"
+    assert main._answer_for_console(failure_report, full=False) == failure_report
+
+
 def test_benchmark_refuses_general_verification_mode(monkeypatch):
     import main
     from config import settings

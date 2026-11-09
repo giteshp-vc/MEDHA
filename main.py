@@ -1,10 +1,11 @@
 import argparse
 import asyncio
 import json
+import re
 import sys
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 from benchmark.baseline import SingleAgentBaseline
 from benchmark.evaluator import BenchmarkEvaluator
@@ -36,6 +37,31 @@ def _console_text(text: Any) -> str:
     return str(text or "").translate(_TYPOGRAPHIC_TO_ASCII)
 
 
+_DIRECT_ANSWER_HEADING = re.compile(r"^#{1,6}\s*direct answer\s*:?\s*$", re.IGNORECASE)
+
+
+def _direct_answer(report: str) -> Optional[str]:
+    """Return the body of the report's 'Direct Answer' section, or None if absent."""
+    lines = (report or "").splitlines()
+    for index, line in enumerate(lines):
+        if _DIRECT_ANSWER_HEADING.match(line.strip()):
+            body: List[str] = []
+            for following in lines[index + 1:]:
+                stripped = following.strip()
+                if stripped.startswith("#") or stripped == "---":
+                    break
+                body.append(following.rstrip())
+            text = "\n".join(body).strip()
+            return text or None
+    return None
+
+
+def _answer_for_console(report: str, full: bool) -> str:
+    if full:
+        return _console_text(report)
+    return _console_text(_direct_answer(report) or report)
+
+
 def _format_rate(val: Any) -> str:
     """Format rate as percentage string, safely handling both fraction (0.0-1.0) and percentage (0.0-100.0)."""
     if val is None:
@@ -48,7 +74,7 @@ def _format_rate(val: Any) -> str:
         return "N/A"
 
 
-async def run_interactive_session():
+async def run_interactive_session(full_report: bool = False):
     """Run interactive terminal session for MEDHA."""
     print(BANNER)
     try:
@@ -89,7 +115,7 @@ async def run_interactive_session():
             print("======================================================================")
             print("                         FINAL SYNTHESIS                              ")
             print("======================================================================\n")
-            print(_console_text(result.final_answer))
+            print(_answer_for_console(result.final_answer, full_report))
             print("\n======================================================================")
             print("                       EXECUTION SUMMARY                              ")
             print("======================================================================")
@@ -131,16 +157,18 @@ async def run_interactive_session():
             print(f"\n[ERROR] An error occurred: {e}")
 
 
-async def run_single_task(task_text: str):
+async def run_single_task(task_text: str, full_report: bool = False):
     """Run a single task passed via command line."""
     validate_settings()
     orchestrator = MedhaOrchestrator()
     print(f"Executing MEDHA for task: '{task_text}'\n")
     result = await orchestrator.run_task(task_text)
-    print(_console_text(result.final_answer))
+    print(_answer_for_console(result.final_answer, full_report))
     print("\n--- Summary ---")
     print(f"Execution ID: {result.execution_id} | Duration: {result.duration_seconds}s | Status: {result.status}")
     print(f"Support Rate: {_format_rate(result.verification_report.get('support_rate', 0.0))}")
+    if not full_report:
+        print(f"Full report: logs/execution_{result.execution_id}.json (or rerun with --full)")
 
 
 async def run_benchmark_cli(
@@ -208,6 +236,11 @@ def main():
         action="store_true",
         help="Start the MEDHA MCP server over stdio",
     )
+    parser.add_argument(
+        "--full",
+        action="store_true",
+        help="Print the full verification report instead of only the direct answer",
+    )
 
     args = parser.parse_args()
 
@@ -250,9 +283,9 @@ def main():
         res = asyncio.run(baseline.run(args.baseline))
         print(_console_text(res.answer))
     elif args.task:
-        asyncio.run(run_single_task(args.task))
+        asyncio.run(run_single_task(args.task, full_report=args.full))
     else:
-        asyncio.run(run_interactive_session())
+        asyncio.run(run_interactive_session(full_report=args.full))
 
 
 if __name__ == "__main__":
