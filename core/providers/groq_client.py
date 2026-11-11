@@ -6,6 +6,7 @@ from pydantic import BaseModel
 from config.settings import (
     GROQ_API_KEY,
     GROQ_MODEL,
+    GROQ_REASONING_EFFORT,
     INITIAL_RETRY_DELAY,
     MAX_LLM_CALLS_PER_TASK,
     MAX_OUTPUT_TOKENS_PER_CALL,
@@ -218,6 +219,8 @@ class GroqClient(BaseLLMClient):
                 "temperature": temp,
                 "max_tokens": output_limit,
             }
+            if GROQ_REASONING_EFFORT:
+                kwargs["reasoning_effort"] = GROQ_REASONING_EFFORT
             if timeout_seconds is not None:
                 kwargs["timeout"] = timeout_seconds
 
@@ -310,6 +313,8 @@ class GroqClient(BaseLLMClient):
                 "temperature": temp,
                 "max_tokens": output_limit,
             }
+            if GROQ_REASONING_EFFORT:
+                kwargs["reasoning_effort"] = GROQ_REASONING_EFFORT
             if timeout_seconds is not None:
                 kwargs["timeout"] = timeout_seconds
 

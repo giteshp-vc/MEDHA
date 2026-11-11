@@ -878,6 +878,10 @@ async def test_deterministic_synthesis_labels_and_separates_unverified_content()
 
     assert "UNVERIFIED COMPILATION" in answer
     assert "Partial specialist deliverable retained." in answer
+    assert "## Direct Answer\n_Unverified: final synthesis failed" in answer
+    import main
+
+    assert main._answer_for_console(answer, full=False).endswith("Partial specialist deliverable retained.")
     assert "Assumptions (Unverified)" in answer
     assert "Recommendations (Unverified)" in answer
     assert "Proposed Performance Targets (Not Measurements)" in answer

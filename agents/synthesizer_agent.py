@@ -279,7 +279,8 @@ class SynthesizerAgent(BaseAgent):
             "**UNVERIFIED COMPILATION:** All specialist-generated content below is unverified unless explicitly "
             "listed in the review status section. Reviewer acceptance does not establish empirical results or "
             "replace missing external evidence.\n\n"
-            "### Interruption\n"
+            + SynthesizerAgent._fallback_direct_answer(specialist_results)
+            + "### Interruption\n"
             f"- Synthesis generation failed: {type(synthesis_error).__name__}: {synthesis_error}\n"
             f"- Verification / execution status: {verification_report.summary_message or 'Unavailable.'}\n"
             f"- Execution notice: {notice}\n\n"
@@ -306,6 +307,30 @@ class SynthesizerAgent(BaseAgent):
             "### Unresolved Questions\n"
             + questions
         )
+
+    @staticmethod
+    def _fallback_direct_answer(specialist_results: List[Dict[str, Any]]) -> str:
+        """Use the last completed specialist deliverable (usually the integrating step) as an unverified answer."""
+        for specialist in reversed(specialist_results):
+            output = (specialist.get("output") or "").strip()
+            if not output or not str(specialist.get("status", "")).endswith("COMPLETED") or specialist.get("error"):
+                continue
+            body_lines = []
+            for line in output.splitlines():
+                stripped = line.strip()
+                if stripped.startswith("#"):
+                    line = f"**{stripped.lstrip('#').strip()}**"
+                elif stripped == "---":
+                    line = ""
+                body_lines.append(line.rstrip())
+            return (
+                "## Direct Answer\n"
+                f"_Unverified: final synthesis failed, so this is the deliverable of "
+                f"{specialist.get('role', 'a specialist')} ({specialist.get('subtask_id', 'unknown')})._\n\n"
+                + "\n".join(body_lines).strip()
+                + "\n\n---\n\n"
+            )
+        return ""
 
     @staticmethod
     def _format_claim(claim: Claim) -> str:

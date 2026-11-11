@@ -17,6 +17,8 @@ LLM_PROVIDER = os.getenv("LLM_PROVIDER", "groq")
 # Groq Configuration (Primary)
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
+# Reasoning models only (e.g. gpt-oss): 'low' leaves more of the output limit for the answer. Blank = provider default.
+GROQ_REASONING_EFFORT = os.getenv("GROQ_REASONING_EFFORT", "").strip().lower()
 
 # Google Gemini Configuration (Optional Alternative)
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -134,6 +136,9 @@ def validate_settings() -> bool:
 
     if PROVIDER_TOKENS_PER_MINUTE < 0:
         raise ValueError("PROVIDER_TOKENS_PER_MINUTE cannot be negative.")
+
+    if GROQ_REASONING_EFFORT not in ("", "none", "default", "low", "medium", "high"):
+        raise ValueError("GROQ_REASONING_EFFORT must be blank or one of: none, default, low, medium, high.")
 
     if MAX_TOKENS_PER_TASK < 1:
         raise ValueError("MAX_TOKENS_PER_TASK must be at least 1.")

@@ -79,6 +79,23 @@ def test_groq_output_limit_fits_provider_tpm(monkeypatch, tpm, input_tokens, req
     assert GroqClient._fit_output_limit(input_tokens, requested) == expected
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("effort", ["", "low"])
+async def test_groq_reasoning_effort_is_sent_only_when_configured(monkeypatch, effort):
+    import core.providers.groq_client as groq_module
+
+    monkeypatch.setattr(groq_module, "GROQ_REASONING_EFFORT", effort)
+    sdk_client = MagicMock()
+    sdk_client.chat.completions.create = AsyncMock(
+        return_value=MagicMock(choices=[MagicMock(message=MagicMock(content="ok"))], usage=None)
+    )
+    client = GroqClient(api_key="mock", default_model="m", client=sdk_client)
+
+    assert await client.generate_text("hi", max_tokens=64, max_retries=0) == "ok"
+    kwargs = sdk_client.chat.completions.create.await_args.kwargs
+    assert kwargs.get("reasoning_effort") == (effort or None)
+
+
 def test_daily_token_limit_remains_quota_exhaustion():
     from utils.retry import classify_error
 
