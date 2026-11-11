@@ -234,6 +234,30 @@ async def test_invalid_response_identity_is_rejected():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "echoed, accepted",
+    [("none", True), (" CLAIM:EXEC_COORD:T1:0 ", True), ("claim:exec_coord:T9:9", False)],
+)
+async def test_response_claim_reference_tolerates_echo_drift_but_not_other_claims(echoed, accepted):
+    trigger = make_trigger()
+    client = MagicMock()
+    client.generate_structured = AsyncMock(
+        return_value=make_response(trigger).model_copy(update={"claim_reference": echoed})
+    )
+    coordinator, bus, _, _, _ = make_coordinator(client, StaticPolicy([trigger]))
+
+    report = await coordinator.run()
+
+    if accepted:
+        assert report.exchanges[0].response_message_id is not None
+        reply = bus.get_history(task_id="exec_coord")[-1]
+        assert reply.claim_references == [trigger.claim_reference]
+    else:
+        assert report.exchanges[0].response_message_id is None
+        assert "claim reference" in report.exchanges[0].diagnostic.lower()
+
+
+@pytest.mark.asyncio
 async def test_cross_execution_reply_is_rejected_by_message_bus():
     trigger = make_trigger()
     client = MagicMock()

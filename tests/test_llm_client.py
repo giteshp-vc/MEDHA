@@ -389,8 +389,12 @@ async def test_groq_server_500_does_not_fallback_to_plain_text():
 
 
 @pytest.mark.asyncio
-async def test_llm_call_budget_enforcement():
+async def test_llm_call_budget_enforcement(monkeypatch):
     """Verify that exceeding MAX_LLM_CALLS_PER_TASK raises LLMBudgetExceededError centrally."""
+    import core.providers.groq_client as groq_module
+
+    # Pin the code default so a local .env override cannot change this test.
+    monkeypatch.setattr(groq_module, "MAX_LLM_CALLS_PER_TASK", 25)
     tracker = TokenTracker(name="budget_test")
     # Simulate tracker having made 25 requests
     for _ in range(25):

@@ -60,6 +60,21 @@ def _enum_value(value: object) -> str:
     return str(getattr(value, "value", value))
 
 
+_EMPTY_CLAIM_REFERENCES = {"", "none", "null", "n/a", "na"}
+
+
+def _normalize_claim_reference(value: Optional[str]) -> str:
+    return str(value or "").strip().strip("[]()<>`'\"").strip().lower()
+
+
+def _same_claim_reference(response_reference: Optional[str], trigger_reference: Optional[str]) -> bool:
+    """Tolerate model echo drift; an absent/'none' response reference never conflicts."""
+    response_value = _normalize_claim_reference(response_reference)
+    if response_value in _EMPTY_CLAIM_REFERENCES:
+        return True
+    return response_value == _normalize_claim_reference(trigger_reference)
+
+
 class DeliberationCoordinator:
     """Run bounded targeted specialist responses without rerunning specialist tasks."""
 
@@ -455,6 +470,7 @@ class DeliberationCoordinator:
             report.diagnostics.append(validation_error)
             self._termination_hint = DeliberationTerminationReason.AGENT_FAILURE
             return exchange
+        response = response.model_copy(update={"claim_reference": trigger.claim_reference})
 
         response_message_type = _RESPONSE_MESSAGE_TYPES.get(
             DeliberationResponseType(response.response_type)
@@ -788,7 +804,7 @@ class DeliberationCoordinator:
             return "Response recipient identity did not match the initiating agent."
         if response.reply_to_message_id and response.reply_to_message_id != request_message_id:
             return "Response reply target did not match the originating request message."
-        if response.claim_reference and response.claim_reference != trigger.claim_reference:
+        if not _same_claim_reference(response.claim_reference, trigger.claim_reference):
             return "Response claim reference did not match the trigger."
         return None
 
