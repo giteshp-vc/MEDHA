@@ -9,6 +9,7 @@ from models.deliberation_models import DeliberationReport
 from models.schemas import AgentStatus, ClaimKind
 from models.verification_models import Claim, RepairAttempt, VerificationReport
 from utils.logger import get_logger
+from utils.token_tracker import TokenTracker
 from verification.claim_extractor import classify_claim_kind
 
 logger = get_logger("synthesizer_agent")
@@ -95,16 +96,21 @@ class SynthesizerAgent(BaseAgent):
         ) or "No repairs performed."
 
         # Format specialist deliverables
-        specialist_text = ""
-        for s in specialist_results:
-            specialist_text += (
-                f"\n\n### Specialist: {s.get('role')} (Subtask: {s.get('subtask_id')})\n"
-                f"Status: {s.get('status', 'UNKNOWN')}\n"
-                f"Execution diagnostic: {s.get('error') or 'None'}\n"
-                f"Findings: {json.dumps(s.get('findings', []))}\n"
-                f"Assumptions: {json.dumps(s.get('assumptions', []))}\n"
-                f"Deliverable Details:\n{s.get('output', '')}\n"
-            )
+        def build_specialist_text(deliverable_cap: Optional[int]) -> str:
+            text = ""
+            for s in specialist_results:
+                output = s.get("output", "") or ""
+                if deliverable_cap is not None and len(output) > deliverable_cap:
+                    output = output[:deliverable_cap].rstrip() + "\n...[deliverable truncated to fit the model context]"
+                text += (
+                    f"\n\n### Specialist: {s.get('role')} (Subtask: {s.get('subtask_id')})\n"
+                    f"Status: {s.get('status', 'UNKNOWN')}\n"
+                    f"Execution diagnostic: {s.get('error') or 'None'}\n"
+                    f"Findings: {json.dumps(s.get('findings', []))}\n"
+                    f"Assumptions: {json.dumps(s.get('assumptions', []))}\n"
+                    f"Deliverable Details:\n{output}\n"
+                )
+            return text
 
         questions_text = "\n".join(f"- {q}" for q in unresolved_questions) or "None recorded."
 
@@ -138,7 +144,7 @@ class SynthesizerAgent(BaseAgent):
             "evidence-grounded, or independently verified."
         )
 
-        prompt = (
+        prompt_head = (
             f"ORIGINAL USER TASK:\n{task_description}\n"
             f"{partial_notice_str}\n"
             f"VERIFICATION STATUS:\n"
@@ -150,11 +156,27 @@ class SynthesizerAgent(BaseAgent):
             f"- Unverifiable Claims ({len(verification_report.unverifiable_claims)}):\n{unverifiable_text}\n\n"
             f"- Unreviewed Claims ({len(verification_report.unreviewed_claims)}):\n{unreviewed_text}\n\n"
             f"- Repaired Claims ({len(verification_report.repair_history)}):\n{repairs_text}\n\n"
-            f"DELIBERATION TRANSCRIPT (UNVERIFIED CONTEXT, NOT EVIDENCE):\n{deliberation_text}\n\n"
-            f"SPECIALIST CONTRIBUTIONS:\n{specialist_text}\n\n"
-            f"UNRESOLVED QUESTIONS & RISKS:\n{questions_text}\n\n"
-            f"Please synthesize the final, comprehensive, and evidence-traceable response for the user."
         )
+
+        def build_prompt(deliverable_cap: Optional[int], deliberation_cap: Optional[int]) -> str:
+            deliberation = deliberation_text
+            if deliberation_cap is not None and len(deliberation) > deliberation_cap:
+                deliberation = deliberation[:deliberation_cap].rstrip() + "\n...[transcript truncated]"
+            return (
+                prompt_head
+                + f"DELIBERATION TRANSCRIPT (UNVERIFIED CONTEXT, NOT EVIDENCE):\n{deliberation}\n\n"
+                f"SPECIALIST CONTRIBUTIONS:\n{build_specialist_text(deliverable_cap)}\n\n"
+                f"UNRESOLVED QUESTIONS & RISKS:\n{questions_text}\n\n"
+                f"Please synthesize the final, comprehensive, and evidence-traceable response for the user."
+            )
+
+        # Claims and audit are never trimmed; only bulky specialist prose and the transcript shrink.
+        input_limit = self._synthesis_input_limit()
+        prompt = build_prompt(None, None)
+        for deliverable_cap, deliberation_cap in ((3000, 3000), (1500, 1500), (600, 600), (0, 0)):
+            if TokenTracker.estimate_tokens(prompt + system_instruction) <= input_limit:
+                break
+            prompt = build_prompt(deliverable_cap, deliberation_cap)
 
         try:
             with self.client.get_token_tracker().call_context(
@@ -307,6 +329,17 @@ class SynthesizerAgent(BaseAgent):
             "### Unresolved Questions\n"
             + questions
         )
+
+    @staticmethod
+    def _synthesis_input_limit() -> int:
+        """Largest synthesis prompt (local token estimate) that leaves room for a useful answer."""
+        from config import settings
+
+        limit = settings.MAX_INPUT_TOKENS_PER_CALL
+        if settings.PROVIDER_TOKENS_PER_MINUTE > 0:
+            # Keep ~1.5k tokens of the per-request cap free for the answer itself.
+            limit = min(limit, int(settings.PROVIDER_TOKENS_PER_MINUTE * 0.9) - 1536)
+        return max(1, limit)
 
     @staticmethod
     def _fallback_direct_answer(specialist_results: List[Dict[str, Any]]) -> str:

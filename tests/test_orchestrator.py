@@ -21,6 +21,7 @@ from models.schemas import AgentStatus, ClaimStatus, TaskStatus, VerificationDec
 from models.task_models import SubTask, TaskPlan, TaskResult
 from models.frozen_plan import FrozenTaskPlan, validate_task_plan
 from models.verification_models import Claim, VerificationReport
+from utils.token_tracker import TokenTracker
 from utils.retry import LLMQuotaExhaustedError
 from verification.evidence_ledger import EvidenceLedger
 from verification.claim_extractor import ClaimExtractor
@@ -947,6 +948,39 @@ async def test_deterministic_synthesis_includes_deliberation_claim_status_and_di
     assert "Agent-supplied evidence references (UNVERIFIED, not ledger evidence)" in answer
     assert "Specialists disagree about this assertion." in answer
     assert "disagreement is not a factual conclusion" in answer
+
+
+@pytest.mark.asyncio
+async def test_synthesis_prompt_trims_long_deliverables_but_keeps_claims(monkeypatch):
+    from agents.synthesizer_agent import SynthesizerAgent
+    from config import settings
+
+    monkeypatch.setattr(settings, "MAX_INPUT_TOKENS_PER_CALL", 12000)
+    monkeypatch.setattr(settings, "PROVIDER_TOKENS_PER_MINUTE", 8000)
+    client = MagicMock()
+    client.get_token_tracker.return_value = TokenTracker(name="synthesis_trim_test", essential_token_reserves={})
+    client.generate_text = AsyncMock(return_value="## Direct Answer\nOK")
+    report = VerificationReport(
+        total_claims=1,
+        accepted_claims=[
+            Claim(claim_id="kept_claim", claim_text="This accepted claim must survive trimming.", originating_agent="a1")
+        ],
+    )
+
+    await SynthesizerAgent(llm_client=client).synthesize(
+        task_description="Long task",
+        specialist_results=[
+            {"role": f"Specialist {i}", "subtask_id": f"T{i}", "status": "COMPLETED", "output": "x" * 20000}
+            for i in range(4)
+        ],
+        verification_report=report,
+        unresolved_questions=[],
+    )
+
+    kwargs = client.generate_text.await_args.kwargs
+    assert TokenTracker.estimate_tokens(kwargs["prompt"] + kwargs["system_instruction"]) <= int(8000 * 0.9) - 1536
+    assert "This accepted claim must survive trimming." in kwargs["prompt"]
+    assert "deliverable truncated to fit the model context" in kwargs["prompt"]
 
 
 @pytest.mark.asyncio
