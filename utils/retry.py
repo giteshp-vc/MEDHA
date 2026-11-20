@@ -38,6 +38,32 @@ PER_MINUTE_LIMIT_KEYWORDS = [
     "per minute",
 ]
 
+SAFE_PROVIDER_ERROR_CODES = frozenset({
+    "aborted",
+    "bad_request",
+    "cancelled",
+    "context_length_exceeded",
+    "deadline_exceeded",
+    "failed_precondition",
+    "insufficient_quota",
+    "internal",
+    "invalid_api_key",
+    "invalid_argument",
+    "invalid_request_error",
+    "json_mode_not_supported",
+    "model_not_found",
+    "not_found",
+    "permission_denied",
+    "rate_limit_exceeded",
+    "resource_exhausted",
+    "server_error",
+    "service_unavailable",
+    "unauthenticated",
+    "unavailable",
+    "unsupported_parameter",
+    "unsupported_value",
+})
+
 
 class LLMError(Exception):
     """Base exception for LLM operations."""
@@ -188,6 +214,24 @@ def extract_retry_after(exc: Exception) -> Optional[float]:
             duration *= 3600.0
         return duration
 
+    return None
+
+
+def extract_provider_error_code(exc: BaseException) -> Optional[str]:
+    """Return only a known provider error code; never retain provider messages or bodies."""
+    candidates = [getattr(exc, "provider_error_code", None), getattr(exc, "code", None)]
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        nested_error = body.get("error")
+        sources = [nested_error, body] if isinstance(nested_error, dict) else [body]
+        for source in sources:
+            candidates.extend(source.get(key) for key in ("code", "status", "type"))
+
+    for candidate in candidates:
+        if isinstance(candidate, str):
+            normalized = candidate.strip().lower()
+            if normalized in SAFE_PROVIDER_ERROR_CODES:
+                return normalized
     return None
 
 

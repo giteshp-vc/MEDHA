@@ -10,6 +10,7 @@ import pytest
 from config import settings
 from core.orchestrator import MedhaOrchestrator, MedhaResult
 from core.providers.gemini_client import GeminiClient
+from models.provider_call import ProviderCallRecord, ProviderCallStatus
 from storage.workspace import ExecutionWorkspace, ExecutionWorkspaceManager, _pid_alive
 from utils.logger import ExecutionRecord
 from utils.privacy import storage_mode_context
@@ -235,15 +236,27 @@ async def test_ephemeral_outcomes_do_not_write_execution_content(monkeypatch, tm
     assert list((tmp_path / "ephemeral").glob("*")) == []
 
 
-@pytest.mark.parametrize("fail_synthesis", [False, True])
+@pytest.mark.parametrize(
+    ("fail_synthesis", "outcome"),
+    [(False, "SUCCESS"), (False, "PARTIAL_FAILURE"), (True, "FAILED")],
+)
 @pytest.mark.asyncio
 async def test_ephemeral_cli_success_and_failure_do_not_write_reports(
-    monkeypatch, tmp_path, capsys, fail_synthesis
+    monkeypatch, tmp_path, capsys, fail_synthesis, outcome
 ):
     monkeypatch.setattr(settings, "MEDHA_STORAGE_MODE", "ephemeral")
     monkeypatch.setattr("main.validate_settings", lambda: None)
     monkeypatch.setattr("utils.logger.LOGS_DIR", tmp_path / "logs")
     orchestrator = _mock_orchestrator(monkeypatch, tmp_path)
+    diagnostic_snapshots = []
+    from main import _print_execution_diagnostics as print_execution_diagnostics
+
+    def capture_diagnostics(snapshot):
+        assert list((tmp_path / "ephemeral").glob("*"))
+        diagnostic_snapshots.append(snapshot)
+        print_execution_diagnostics(snapshot)
+
+    monkeypatch.setattr("main._print_execution_diagnostics", capture_diagnostics)
 
     async def execute(task, **kwargs):
         record = ExecutionRecord(kwargs["execution_id"], task)
@@ -251,7 +264,45 @@ async def test_ephemeral_cli_success_and_failure_do_not_write_reports(
         record.save((tmp_path / "logs" / f"execution_{kwargs['execution_id']}.json"))
         if fail_synthesis:
             raise RuntimeError("private synthesis failure")
-        return MedhaResult(execution_id=kwargs["execution_id"], task=task, final_answer="CLI answer")
+        return MedhaResult(
+            execution_id=kwargs["execution_id"],
+            task=task,
+            final_answer="CLI answer",
+            status=outcome,
+            execution_status_reasons=["specialist_subtask_failed"] if outcome == "PARTIAL_FAILURE" else [],
+            token_usage={
+                "prompt_tokens": 9,
+                "candidate_tokens": 4,
+                "total_tokens": 13,
+                "accounted_total_tokens": 13,
+                "usage_source": "provider",
+            },
+            provider_call_records=[
+                ProviderCallRecord(
+                    attempt_number=1,
+                    retry_number=0,
+                    max_retry_attempts=2,
+                    provider="groq",
+                    model="mock-model",
+                    stage="verification",
+                    status=ProviderCallStatus.FAILED,
+                    error_category="LLMRateLimitError",
+                    http_status_code=429,
+                    provider_error_code="synthetic-private-code-marker",
+                    retry_classification="RETRYABLE",
+                    sanitized_error="LLMRateLimitError (status 429)",
+                ),
+                ProviderCallRecord(
+                    attempt_number=2,
+                    retry_number=1,
+                    max_retry_attempts=2,
+                    provider="groq",
+                    model="mock-model",
+                    stage="verification",
+                    status=ProviderCallStatus.SUCCEEDED,
+                ),
+            ],
+        )
 
     orchestrator._run_task = AsyncMock(side_effect=execute)
     monkeypatch.setattr("main.MedhaOrchestrator", lambda **kwargs: orchestrator)
@@ -260,8 +311,24 @@ async def test_ephemeral_cli_success_and_failure_do_not_write_reports(
 
     output = capsys.readouterr().out
     assert "private synthesis failure" not in output
+    assert "private CLI task" not in output
     assert not list((tmp_path / "logs").glob("execution_*.json"))
     assert list((tmp_path / "ephemeral").glob("*")) == []
+    assert len(diagnostic_snapshots) == 1
+    assert diagnostic_snapshots[0]["status"] == ("FAILED" if fail_synthesis else outcome)
+    if fail_synthesis:
+        assert "Tokens (existing tracker totals): input=0, output=0, total=0" in output
+        assert "succeeded=0, failed=0" in output
+        assert "execution_setup_failed:RuntimeError" in output
+    else:
+        assert "Tokens (existing tracker totals): input=9, output=4, total=13" in output
+        assert "succeeded=1, failed=1" in output
+        assert "retried_attempts=1" in output
+        assert "stage=verification" in output
+        assert "http_status=429" in output
+        assert "provider_code=N/A" in output
+        assert "synthetic-private-code-marker" not in output
+        assert "retry_classification=RETRYABLE" in output
 
 
 def test_persistent_retention_sweep_removes_expired_workspace(tmp_path):
@@ -296,6 +363,45 @@ def _mock_orchestrator(monkeypatch, root, persistent=False):
 
 
 @pytest.mark.asyncio
+async def test_successful_retry_records_do_not_downgrade_execution_status(monkeypatch, tmp_path):
+    orchestrator = _mock_orchestrator(monkeypatch, tmp_path)
+    failed_attempt = ProviderCallRecord(
+        attempt_number=1,
+        retry_number=0,
+        max_retry_attempts=2,
+        provider="groq",
+        status=ProviderCallStatus.FAILED,
+        error_category="LLMServerError",
+        http_status_code=503,
+        retry_classification="RETRYABLE",
+    )
+    successful_retry = ProviderCallRecord(
+        attempt_number=2,
+        retry_number=1,
+        max_retry_attempts=2,
+        provider="groq",
+        status=ProviderCallStatus.SUCCEEDED,
+    )
+    orchestrator._run_task = AsyncMock(side_effect=lambda task, **kwargs: MedhaResult(
+        execution_id=kwargs["execution_id"],
+        task=task,
+        final_answer="answer",
+        provider_call_records=[failed_attempt, successful_retry],
+        token_usage={"prompt_tokens": 9, "candidate_tokens": 4, "total_tokens": 13},
+    ))
+
+    result = await orchestrator.run_task("retry succeeded")
+
+    assert result.status == "SUCCESS"
+    assert result.execution_status_reasons == []
+    assert result.token_usage["total_tokens"] == 13
+    assert [record.status for record in result.provider_call_records] == [
+        ProviderCallStatus.FAILED,
+        ProviderCallStatus.SUCCEEDED,
+    ]
+
+
+@pytest.mark.asyncio
 async def test_orchestrator_cleans_ephemeral_workspace_after_success(monkeypatch, tmp_path):
     orchestrator = _mock_orchestrator(monkeypatch, tmp_path)
     orchestrator._run_task = AsyncMock(side_effect=lambda task, **kwargs: MedhaResult(
@@ -319,6 +425,8 @@ async def test_orchestrator_cleans_ephemeral_workspace_after_exception(monkeypat
 
     assert result.status == "FAILED"
     assert result.cleanup_verified is True
+    assert result.token_usage["total_tokens"] == 0
+    assert result.provider_call_records == []
     assert "private failure detail" not in result.final_answer
     assert list((tmp_path / "ephemeral").glob("*")) == []
 
@@ -327,10 +435,25 @@ async def test_orchestrator_cleans_ephemeral_workspace_after_exception(monkeypat
 async def test_orchestrator_cleans_ephemeral_workspace_after_cancellation(monkeypatch, tmp_path):
     orchestrator = _mock_orchestrator(monkeypatch, tmp_path)
     orchestrator._run_task = AsyncMock(side_effect=asyncio.CancelledError())
+    snapshots = []
+
+    def capture_diagnostics(snapshot):
+        if snapshot["diagnostic_phase"] == "before_cleanup":
+            assert list((tmp_path / "ephemeral").glob("*"))
+        else:
+            assert list((tmp_path / "ephemeral").glob("*")) == []
+        snapshots.append(snapshot)
 
     with pytest.raises(asyncio.CancelledError):
-        await orchestrator.run_task("private task")
+        await orchestrator.run_task("private task", diagnostics_callback=capture_diagnostics)
 
+    assert snapshots[0]["diagnostic_phase"] == "before_cleanup"
+    assert snapshots[0]["status"] == "INTERRUPTED"
+    assert snapshots[0]["status_reasons"] == ["execution_cancelled"]
+    assert snapshots[1]["diagnostic_phase"] == "after_cleanup"
+    assert snapshots[1]["cleanup_mode"] == "ephemeral"
+    assert snapshots[1]["cleanup_verified"] is True
+    assert snapshots[1]["cleanup_removed"] is True
     assert list((tmp_path / "ephemeral").glob("*")) == []
 
 
@@ -352,14 +475,20 @@ async def test_orchestrator_cleans_ephemeral_workspace_after_timeout(monkeypatch
 @pytest.mark.asyncio
 async def test_orchestrator_retains_only_when_persistent_mode_selected(monkeypatch, tmp_path):
     orchestrator = _mock_orchestrator(monkeypatch, tmp_path, persistent=True)
+    snapshots = []
     orchestrator._run_task = AsyncMock(side_effect=lambda task, **kwargs: MedhaResult(
         execution_id=kwargs["execution_id"], task=task, final_answer="answer"
     ))
 
-    result = await orchestrator.run_task("private task")
+    def capture_diagnostics(snapshot):
+        assert list((tmp_path / "persistent").glob("*"))
+        snapshots.append(snapshot)
+
+    result = await orchestrator.run_task("private task", diagnostics_callback=capture_diagnostics)
 
     assert result.storage_mode == "persistent"
     assert result.cleanup_verified is None
+    assert snapshots[0]["status"] == "SUCCESS"
     retained = list((tmp_path / "persistent").glob("*"))
     assert len(retained) == 1
     state = json.loads((retained[0] / ExecutionWorkspace.STATE_FILENAME).read_text(encoding="utf-8"))
@@ -400,4 +529,5 @@ async def test_orchestrator_reports_ephemeral_workspace_cleanup_failure(monkeypa
     assert result.cleanup_verified is False
     assert result.cleanup_error == "PermissionError"
     assert result.error == "Execution completed, but ephemeral workspace cleanup could not be verified."
+    assert "ephemeral_workspace_cleanup_unverified" in result.execution_status_reasons
     assert list((tmp_path / "ephemeral").glob("*"))

@@ -61,6 +61,7 @@ class BaseLLMClient(ABC):
         *,
         attempt_number: int,
         retry_number: int = 0,
+        max_retry_attempts: Optional[int] = None,
         is_fallback: bool = False,
         model: Optional[str],
         temperature: Optional[float],
@@ -75,6 +76,7 @@ class BaseLLMClient(ABC):
         return self.token_tracker.provider_call(
             attempt_number=attempt_number,
             retry_number=retry_number,
+            max_retry_attempts=max_retry_attempts,
             is_fallback=is_fallback,
             operator_model_version=operator_model_version,
             model_identifier_policy="provider_may_resolve_mutable_alias",
@@ -95,6 +97,7 @@ class BaseLLMClient(ABC):
         *,
         attempt_number: int,
         retry_number: int = 0,
+        max_retry_attempts: Optional[int] = None,
         is_fallback: bool = False,
         model: Optional[str],
         temperature: Optional[float],
@@ -117,6 +120,7 @@ class BaseLLMClient(ABC):
                 async with self.provider_call(
                     attempt_number=attempt_number,
                     retry_number=retry_number,
+                    max_retry_attempts=max_retry_attempts,
                     is_fallback=is_fallback,
                     model=model,
                     temperature=temperature,

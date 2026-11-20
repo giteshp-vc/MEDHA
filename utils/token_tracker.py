@@ -131,18 +131,28 @@ class ProviderCallRecorder:
         self.record.status = status
         if error is not None:
             classified_error = error
+            retry_classification = "NOT_APPLICABLE"
             if isinstance(error, Exception):
                 try:
-                    from utils.retry import classify_error
+                    from utils.retry import (
+                        classify_error,
+                        extract_provider_error_code,
+                        extract_status_code,
+                    )
 
-                    _, classified_error = classify_error(error)
+                    retryable, classified_error = classify_error(error)
+                    retry_classification = "RETRYABLE" if retryable else "NON_RETRYABLE"
+                    self.record.provider_error_code = extract_provider_error_code(error)
+                    self.record.http_status_code = (
+                        getattr(classified_error, "status_code", None)
+                        or extract_status_code(error)
+                    )
                 except Exception:
                     classified_error = error
             error_name = type(classified_error).__name__
-            status_code = getattr(classified_error, "status_code", None)
-            if status_code is None:
-                status_code = getattr(classified_error, "code", None)
             self.record.error_category = error_name
+            self.record.retry_classification = retry_classification
+            status_code = self.record.http_status_code
             self.record.sanitized_error = (
                 f"{error_name} (status {status_code})"
                 if isinstance(status_code, int)
@@ -263,6 +273,7 @@ class TokenTracker:
         *,
         attempt_number: int,
         retry_number: int = 0,
+        max_retry_attempts: Optional[int] = None,
         is_fallback: bool = False,
         operator_model_version: Optional[str] = None,
         model_identifier_policy: str = "provider_may_resolve_mutable_alias",
@@ -284,6 +295,7 @@ class TokenTracker:
                 async with effective.provider_call(
                     attempt_number=attempt_number,
                     retry_number=retry_number,
+                    max_retry_attempts=max_retry_attempts,
                     is_fallback=is_fallback,
                     operator_model_version=operator_model_version,
                     model_identifier_policy=model_identifier_policy,
@@ -314,6 +326,7 @@ class TokenTracker:
             record = ProviderCallRecord(
                 attempt_number=attempt_number,
                 retry_number=retry_number,
+                max_retry_attempts=max_retry_attempts,
                 is_fallback=is_fallback,
                 operator_model_version=operator_model_version,
                 model_identifier_policy=model_identifier_policy,

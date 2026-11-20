@@ -234,6 +234,8 @@ class GroqClient(BaseLLMClient):
             response, _ = await self.execute_provider_request(
                 lambda: client.chat.completions.create(**kwargs),
                 attempt_number=wire_attempt,
+                retry_number=retry_attempt - 1,
+                max_retry_attempts=max_retries + 1,
                 model=target_model,
                 temperature=temp,
                 output_token_limit=output_limit,
@@ -341,6 +343,7 @@ class GroqClient(BaseLLMClient):
                     send_request,
                     attempt_number=wire_attempt,
                     retry_number=retry_attempt - 1,
+                    max_retry_attempts=max_retries + 1,
                     is_fallback=not use_json_mode,
                     model=target_model,
                     temperature=temp,

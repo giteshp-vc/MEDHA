@@ -641,6 +641,7 @@ async def test_orchestrator_partial_failure_reports_partial_failure():
 
     assert isinstance(result, MedhaResult)
     assert result.status == "PARTIAL_FAILURE"
+    assert "specialist_subtask_failed" in result.execution_status_reasons
     failed_result = next(item for item in result.task_results if item["subtask_id"] == "T2")
     assert failed_result["status"] == TaskStatus.FAILED
     assert "Provider/API failure [subtask T2]" in failed_result["error"]
@@ -701,6 +702,7 @@ async def test_orchestrator_quota_exhaustion_during_verification_reports_partial
     assert isinstance(result, MedhaResult)
     # Specialist completed, so status must be PARTIAL_FAILURE (not FAILED or crash!)
     assert result.status == "PARTIAL_FAILURE"
+    assert "verification_interrupted_provider_quota" in result.execution_status_reasons
     # Specialist deliverable must be preserved
     assert len(result.task_results) == 1
     assert "Kafka cluster with 12 partitions" in result.task_results[0]["output"]
@@ -1089,6 +1091,7 @@ async def test_claim_capacity_overflow_reports_discovered_registered_and_unregis
     assert len(result.claims) == 2
     assert result.status == "PARTIAL_FAILURE"
     diagnostic = " ".join(result.claim_extraction_errors)
+    assert "claim_extraction_incomplete" in result.execution_status_reasons
     assert "discovered=3" in diagnostic
     assert "registered=2" in diagnostic
     assert "unregistered=1" in diagnostic
@@ -1321,6 +1324,7 @@ async def test_incomplete_deliberation_preserves_specialist_results_and_report(
     result = await orchestrator.run_task("Deliberation interruption")
 
     assert result.status == "PARTIAL_FAILURE"
+    assert f"deliberation_incomplete_{termination_reason.value.lower()}" in result.execution_status_reasons
     assert result.task_results[0]["output"] == "Preserved specialist output."
     assert result.deliberation_report.termination_reason == termination_reason
     assert result.deliberation_report.exchanges[0].response_message_id == "msg_response"

@@ -1,7 +1,7 @@
 import asyncio
 import time
 from contextlib import asynccontextmanager
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 from pydantic import BaseModel, Field
 
 from communication.message_bus import MessageBus
@@ -111,7 +111,9 @@ class MedhaResult(BaseSchema):
     plan_artifact: Optional[FrozenTaskPlan] = None
     accounting: Optional[AccountingSnapshot] = None
     provider_call_records: List[ProviderCallRecord] = Field(default_factory=list)
+    provider_call_records_dropped: int = 0
     status: str = "SUCCESS"  # Truthful status: SUCCESS, PARTIAL_FAILURE, FAILED
+    execution_status_reasons: List[str] = Field(default_factory=list)
     duration_seconds: float = 0.0
     token_usage: Dict[str, Any] = Field(default_factory=dict)
     generated_agents: List[Dict[str, Any]] = Field(default_factory=list)
@@ -217,10 +219,70 @@ class MedhaOrchestrator:
         return retriever, diagnostics
 
     @staticmethod
+    def _add_status_reason(result: MedhaResult, reason: str) -> None:
+        if reason not in result.execution_status_reasons:
+            result.execution_status_reasons.append(reason)
+
+    @staticmethod
+    def _emit_diagnostics_callback(
+        callback: Optional[Callable[[Dict[str, Any]], None]],
+        result: Optional[MedhaResult],
+        tracker: TokenTracker,
+        execution_id: str,
+        interrupted: bool = False,
+        diagnostic_phase: str = "before_cleanup",
+        cleanup_result: Optional[CleanupResult] = None,
+    ) -> None:
+        if callback is None:
+            return
+        snapshot = {
+            "execution_id": execution_id,
+            "diagnostic_phase": diagnostic_phase,
+            "status": "INTERRUPTED" if interrupted else (result.status if result else "FAILED"),
+            "status_reasons": (
+                ["execution_cancelled"] if interrupted
+                else list(result.execution_status_reasons) if result else ["execution_setup_failed"]
+            ),
+            "token_usage": (
+                dict(result.token_usage) if result and result.token_usage
+                else tracker.get_summary_sync()
+            ),
+            "provider_call_records": (
+                list(result.provider_call_records) if result and result.provider_call_records
+                else tracker.get_provider_call_records(execution_id)
+            ),
+            "provider_call_records_dropped": (
+                result.provider_call_records_dropped if result
+                else tracker.get_provider_call_records_dropped()
+            ),
+            "cleanup_mode": cleanup_result.mode if cleanup_result else None,
+            "cleanup_verified": cleanup_result.verified if cleanup_result else None,
+            "cleanup_removed": cleanup_result.removed if cleanup_result else None,
+        }
+        try:
+            callback(snapshot)
+        except Exception:
+            logger.warning("Execution diagnostics callback failed.")
+
+    @staticmethod
+    def _attach_tracker_diagnostics(
+        result: MedhaResult,
+        tracker: TokenTracker,
+        execution_id: str,
+    ) -> None:
+        if not result.token_usage:
+            result.token_usage = tracker.get_summary_sync()
+        if not result.provider_call_records:
+            result.provider_call_records = tracker.get_provider_call_records(execution_id)
+        if not result.provider_call_records_dropped:
+            result.provider_call_records_dropped = tracker.get_provider_call_records_dropped()
+
+    @staticmethod
     def _apply_cleanup_result(result: MedhaResult, cleanup: Optional[CleanupResult]) -> None:
         if cleanup is None:
             result.cleanup_verified = False
             result.cleanup_error = "Workspace cleanup did not return a verification result."
+            MedhaOrchestrator._add_status_reason(result, "workspace_cleanup_result_unavailable")
             if result.status != "FAILED":
                 result.status = "PARTIAL_FAILURE"
             return
@@ -230,6 +292,7 @@ class MedhaOrchestrator:
             if cleanup.error:
                 result.status = "PARTIAL_FAILURE"
                 result.error = "Persistent workspace state could not be finalized cleanly."
+                MedhaOrchestrator._add_status_reason(result, "persistent_workspace_finalization_failed")
             return
         result.cleanup_verified = cleanup.verified
         result.cleanup_error = cleanup.error
@@ -238,6 +301,7 @@ class MedhaOrchestrator:
         result.cleanup_error = cleanup.error or "Workspace still exists after cleanup."
         result.status = "PARTIAL_FAILURE"
         result.error = "Execution completed, but ephemeral workspace cleanup could not be verified."
+        MedhaOrchestrator._add_status_reason(result, "ephemeral_workspace_cleanup_unverified")
 
     @staticmethod
     def _execution_failure_result(execution_id: str, task: str, error: Exception, storage_mode: str) -> MedhaResult:
@@ -251,6 +315,7 @@ class MedhaOrchestrator:
                 f"Failure category: {category}."
             ),
             status="FAILED",
+            execution_status_reasons=[f"execution_setup_failed:{category}"],
             error=f"Execution setup failed ({category}).",
             storage_mode=storage_mode,
         )
@@ -262,35 +327,80 @@ class MedhaOrchestrator:
         source_urls: Optional[List[str]] = None,
         storage_mode: Optional[str] = None,
         allowed_document_root: Optional[str] = None,
+        diagnostics_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> MedhaResult:
         execution_id = generate_id("exec")
         mode = (storage_mode or active_storage_mode() or self.storage_mode).strip().lower()
         result: Optional[MedhaResult] = None
         workspace: Optional[ExecutionWorkspace] = None
+        diagnostics_emitted = False
         try:
             async with self._execution_workspace(execution_id, storage_mode=mode) as workspace:
-                retriever, retrieval_diagnostics = await self._build_retriever(
-                    workspace,
-                    documents,
-                    source_urls,
-                    allowed_document_root=allowed_document_root,
+                try:
+                    retriever, retrieval_diagnostics = await self._build_retriever(
+                        workspace,
+                        documents,
+                        source_urls,
+                        allowed_document_root=allowed_document_root,
+                    )
+                    with self.tracker.call_context(execution_id=execution_id):
+                        async with self.tracker.task_budget():
+                            result = await self._run_task(
+                                user_input,
+                                policy=OrchestrationPolicy(),
+                                execution_id=execution_id,
+                                retriever=retriever,
+                                retrieval_diagnostics=retrieval_diagnostics,
+                            )
+                except asyncio.CancelledError:
+                    self._emit_diagnostics_callback(
+                        diagnostics_callback,
+                        None,
+                        self.tracker,
+                        execution_id,
+                        interrupted=True,
+                    )
+                    diagnostics_emitted = True
+                    raise
+                except Exception as error:
+                    result = self._execution_failure_result(execution_id, user_input, error, mode)
+                if result is None:
+                    result = self._execution_failure_result(
+                        execution_id, user_input, RuntimeError("No result was produced."), mode
+                    )
+                result.storage_mode = mode
+                self._attach_tracker_diagnostics(result, self.tracker, execution_id)
+                self._emit_diagnostics_callback(
+                    diagnostics_callback,
+                    result,
+                    self.tracker,
+                    execution_id,
                 )
-                with self.tracker.call_context(execution_id=execution_id):
-                    async with self.tracker.task_budget():
-                        result = await self._run_task(
-                            user_input,
-                            policy=OrchestrationPolicy(),
-                            execution_id=execution_id,
-                            retriever=retriever,
-                            retrieval_diagnostics=retrieval_diagnostics,
-                        )
+                diagnostics_emitted = True
         except asyncio.CancelledError:
+            self._emit_diagnostics_callback(
+                diagnostics_callback,
+                None,
+                self.tracker,
+                execution_id,
+                interrupted=True,
+                diagnostic_phase="after_cleanup",
+                cleanup_result=workspace.cleanup_result if workspace else None,
+            )
             raise
         except Exception as error:
             result = self._execution_failure_result(execution_id, user_input, error, mode)
         if result is None:
             result = self._execution_failure_result(
                 execution_id, user_input, RuntimeError("No result was produced."), mode
+            )
+        self._attach_tracker_diagnostics(result, self.tracker, execution_id)
+        if not diagnostics_emitted:
+            self._emit_diagnostics_callback(
+                diagnostics_callback,
+                result,
+                self.tracker,
+                execution_id,
             )
         self._apply_cleanup_result(result, workspace.cleanup_result if workspace else None)
         result.storage_mode = mode
@@ -489,6 +599,7 @@ class MedhaOrchestrator:
         claim_extraction_errors: List[str] = []
         quota_interrupted_note: Optional[str] = None
         task_results: List[TaskResult] = []
+        status_reasons: List[str] = []
         retrieval_diagnostics = list(retrieval_diagnostics or [])
         deliberation_report: Optional[DeliberationReport] = None
         plan_artifact = frozen_plan
@@ -562,13 +673,22 @@ class MedhaOrchestrator:
 
             if not completed_tasks:
                 execution_status = "FAILED"
+                status_reasons.append("no_specialist_subtasks_completed")
             elif failed_tasks:
                 execution_status = "PARTIAL_FAILURE"
+                for task_result in failed_tasks:
+                    task_status = getattr(task_result.status, "value", str(task_result.status)).lower()
+                    reason = f"specialist_subtask_{task_status}"
+                    if reason not in status_reasons:
+                        status_reasons.append(reason)
+                    if task_result.error and task_status == "completed":
+                        status_reasons.append("specialist_subtask_reported_error")
             else:
                 execution_status = "SUCCESS"
 
             execution_notices = [quota_interrupted_note] if quota_interrupted_note else []
             if retrieval_diagnostics:
+                status_reasons.append("retrieval_incomplete")
                 execution_notices.append(
                     "Knowledge retrieval incomplete: " + " | ".join(retrieval_diagnostics)
                 )
@@ -653,6 +773,14 @@ class MedhaOrchestrator:
                     DeliberationTerminationReason.TASK_CANCELLED,
                     DeliberationTerminationReason.MESSAGE_BUDGET_EXHAUSTED,
                 } and deliberation_report.triggered:
+                    termination_reason = getattr(
+                        deliberation_report.termination_reason,
+                        "value",
+                        deliberation_report.termination_reason,
+                    )
+                    status_reasons.append(
+                        f"deliberation_incomplete_{str(termination_reason).lower()}"
+                    )
                     diagnostics = "; ".join(deliberation_report.diagnostics) or str(
                         deliberation_report.termination_reason
                     )
@@ -874,6 +1002,7 @@ class MedhaOrchestrator:
                 exec_record.metadata["deliberation_report"] = deliberation_report.model_dump(mode="json")
 
             if claim_extraction_errors:
+                status_reasons.append("claim_extraction_incomplete")
                 execution_notices.append("Claim extraction diagnostics: " + " | ".join(claim_extraction_errors))
                 partial_execution_notice = "\n".join(execution_notices)
                 if completed_tasks and execution_status == "SUCCESS":
@@ -883,10 +1012,12 @@ class MedhaOrchestrator:
 
             if extraction_interruption is not None:
                 if isinstance(extraction_interruption, LLMQuotaExhaustedError):
+                    status_reasons.append("claim_extraction_interrupted_provider_quota")
                     quota_interrupted_note = (
                         f"Claim extraction interrupted after provider quota error: {extraction_interruption}"
                     )
                 else:
+                    status_reasons.append("claim_extraction_interrupted_local_budget")
                     quota_interrupted_note = (
                         f"Claim extraction interrupted by local application budget: {extraction_interruption}"
                     )
@@ -925,6 +1056,11 @@ class MedhaOrchestrator:
                             task_context=user_input,
                         )
                 except (LLMQuotaExhaustedError, LLMBudgetExceededError) as quota_err:
+                    status_reasons.append(
+                        "verification_interrupted_provider_quota"
+                        if isinstance(quota_err, LLMQuotaExhaustedError)
+                        else "verification_interrupted_local_budget"
+                    )
                     logger.warning(
                         f"Verification pipeline stopped due to quota/budget exhaustion: {quota_err}"
                     )
@@ -1036,6 +1172,7 @@ class MedhaOrchestrator:
 
             # Finalize execution record and save structured log
             exec_record.metadata["final_answer"] = final_answer
+            exec_record.metadata["execution_status_reasons"] = list(dict.fromkeys(status_reasons))
             exec_record.finish(status=execution_status, token_usage=token_summary)
             exec_record.save()
 
@@ -1069,6 +1206,8 @@ class MedhaOrchestrator:
                 verification_report=verification_report.model_dump(),
                 workflow_stages=workflow.get_summary(),
                 error=quota_interrupted_note,
+                execution_status_reasons=list(dict.fromkeys(status_reasons)),
+                provider_call_records_dropped=self.tracker.get_provider_call_records_dropped(),
             )
 
         except asyncio.CancelledError:
@@ -1087,6 +1226,7 @@ class MedhaOrchestrator:
             )
             if deliberation_report is not None:
                 exec_record.metadata["deliberation_report"] = deliberation_report.model_dump(mode="json")
+            exec_record.metadata["execution_status_reasons"] = ["execution_cancelled"]
             exec_record.finish(status="CANCELLED", token_usage=await self.tracker.get_summary())
             exec_record.save()
             raise
@@ -1107,6 +1247,9 @@ class MedhaOrchestrator:
                 self.tracker.get_provider_call_records_dropped()
             )
             exec_record.finish(status="FAILED")
+            exec_record.metadata["execution_status_reasons"] = [
+                f"execution_error:{type(e).__name__}"
+            ]
             exec_record.save()
 
             token_summary = await self.tracker.get_summary()
@@ -1132,4 +1275,6 @@ class MedhaOrchestrator:
                 verification_report=v_report,
                 workflow_stages=workflow.get_summary(),
                 error=str(e),
+                execution_status_reasons=[f"execution_error:{type(e).__name__}"],
+                provider_call_records_dropped=self.tracker.get_provider_call_records_dropped(),
             )

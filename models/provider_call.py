@@ -1,5 +1,5 @@
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import Field
 
@@ -44,6 +44,7 @@ class ProviderCallRecord(BaseSchema):
     execution_id: Optional[str] = None
     attempt_number: int
     retry_number: int = 0
+    max_retry_attempts: Optional[int] = None
     is_fallback: bool = False
     operator_model_version: Optional[str] = None
     model_version_source: str = "unavailable"
@@ -71,6 +72,9 @@ class ProviderCallRecord(BaseSchema):
     usage_source: ProviderUsageSource = ProviderUsageSource.UNAVAILABLE
     status: ProviderCallStatus = ProviderCallStatus.IN_PROGRESS
     error_category: Optional[str] = None
+    http_status_code: Optional[int] = None
+    provider_error_code: Optional[str] = None
+    retry_classification: Optional[Literal["RETRYABLE", "NON_RETRYABLE", "NOT_APPLICABLE"]] = None
     sanitized_error: Optional[str] = None
 
 

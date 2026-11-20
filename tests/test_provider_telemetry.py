@@ -175,9 +175,38 @@ async def test_provider_error_is_recorded_without_secret_or_request_content():
     serialized = json.dumps(record.model_dump(mode="json"))
     assert record.status == ProviderCallStatus.FAILED
     assert record.error_category == "LLMError"
+    assert record.retry_classification == "NON_RETRYABLE"
+    assert record.provider_error_code is None
     assert "mock-secret" not in serialized
     assert "Sensitive task content" not in serialized
     assert "Authorization" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_unrecognized_provider_error_code_and_payload_are_not_retained():
+    class MockProviderError(Exception):
+        code = 503
+        body = {
+            "error": {
+                "code": "synthetic-private-code-marker",
+                "message": "sensitive provider response marker",
+            }
+        }
+
+    client, tracker, _ = _mock_gemini_client(side_effect=MockProviderError("temporary error"))
+    async with tracker.accounting_session(AccountingContext(trial_id="safe-error-code")) as scope:
+        async with tracker.task_budget(essential_reserves={}):
+            with pytest.raises(LLMError):
+                await client.generate_text("private payload", max_retries=0)
+
+    record = scope.provider_calls[0]
+    serialized = json.dumps(record.model_dump(mode="json"))
+    assert record.http_status_code == 503
+    assert record.provider_error_code is None
+    assert record.retry_classification == "RETRYABLE"
+    assert "synthetic-private-code-marker" not in serialized
+    assert "sensitive provider response marker" not in serialized
+    assert "private payload" not in serialized
 
 
 @pytest.mark.asyncio
@@ -250,7 +279,10 @@ async def test_retry_attempts_are_recorded_separately(monkeypatch):
         code = 503
 
     client, tracker, sdk = _mock_gemini_client(
-        side_effect=[MockServerError("503 temporary unavailable"), _response("recovered")]
+        side_effect=[
+            MockServerError("503 temporary unavailable"),
+            _response("recovered", prompt_tokens=15, candidate_tokens=4, total_tokens=19),
+        ]
     )
     monkeypatch.setattr("core.providers.gemini_client.INITIAL_RETRY_DELAY", 0)
 
@@ -260,11 +292,16 @@ async def test_retry_attempts_are_recorded_separately(monkeypatch):
     assert sdk.aio.models.generate_content.await_count == 2
     assert [record.attempt_number for record in snapshot.provider_calls] == [1, 2]
     assert [record.retry_number for record in snapshot.provider_calls] == [0, 1]
+    assert [record.max_retry_attempts for record in snapshot.provider_calls] == [2, 2]
     assert all(not record.is_fallback for record in snapshot.provider_calls)
     assert [record.status for record in snapshot.provider_calls] == [
         ProviderCallStatus.FAILED,
         ProviderCallStatus.SUCCEEDED,
     ]
+    assert snapshot.token_usage["total_tokens"] == 19
+    assert snapshot.token_usage["provider_usage_requests"] == 1
+    assert snapshot.token_usage["successful_requests"] == 1
+    assert snapshot.token_usage["failed_requests"] == 1
 
 
 @pytest.mark.asyncio
@@ -335,15 +372,57 @@ async def test_concurrent_accounting_sessions_are_isolated():
 
 
 @pytest.mark.asyncio
+async def test_concurrent_provider_calls_keep_stage_and_agent_attribution_isolated():
+    async def respond(model, contents, config):
+        await asyncio.sleep(0.01)
+        return _response(f"response for {contents}")
+
+    client, tracker, _ = _mock_gemini_client(side_effect=respond)
+
+    async def make_call(stage, agent_id, role):
+        with tracker.operation(stage):
+            with tracker.call_context(
+                execution_id="exec-concurrent-stages",
+                agent_id=agent_id,
+                agent_role=role,
+            ):
+                await client.generate_text(prompt=role)
+
+    await asyncio.gather(
+        make_call("verification", "agent-reviewer", "Reviewer"),
+        make_call("synthesis", "agent-synth", "Synthesizer"),
+    )
+
+    records = tracker.get_provider_call_records("exec-concurrent-stages")
+    assert {(record.stage, record.agent_id, record.agent_role) for record in records} == {
+        ("verification", "agent-reviewer", "Reviewer"),
+        ("synthesis", "agent-synth", "Synthesizer"),
+    }
+
+
+@pytest.mark.asyncio
 async def test_partial_trial_snapshot_preserves_successful_and_failed_call_records():
+    class MockServerError(Exception):
+        code = 503
+        body = {
+            "error": {
+                "code": "server_error",
+                "message": "Authorization header: synthetic-payload-marker",
+            }
+        }
+
     client, tracker, sdk = _mock_gemini_client(
-        side_effect=[_response("first succeeded", prompt_tokens=8, candidate_tokens=2, total_tokens=10), RuntimeError("later failure")]
+        side_effect=[
+            _response("first succeeded", prompt_tokens=8, candidate_tokens=2, total_tokens=10),
+            MockServerError("later failure"),
+        ]
     )
     async with tracker.accounting_session(AccountingContext(trial_id="partial")) as scope:
         async with tracker.task_budget(essential_reserves={}):
-            assert await client.generate_text("first", max_retries=0) == "first succeeded"
-            with pytest.raises(LLMError):
-                await client.generate_text("second", max_retries=0)
+            with tracker.operation("synthesis"):
+                assert await client.generate_text("first", max_retries=0) == "first succeeded"
+                with pytest.raises(LLMError):
+                    await client.generate_text("second", max_retries=0)
 
     assert sdk.aio.models.generate_content.await_count == 2
     assert [record.status for record in scope.provider_calls] == [
@@ -352,6 +431,15 @@ async def test_partial_trial_snapshot_preserves_successful_and_failed_call_recor
     ]
     assert scope.snapshot().token_usage["total_tokens"] == 10
     assert scope.snapshot().token_usage["failed_requests"] == 1
+    failed = scope.provider_calls[1]
+    assert failed.stage == "synthesis"
+    assert failed.error_category == "LLMServerError"
+    assert failed.http_status_code == 503
+    assert failed.provider_error_code == "server_error"
+    assert failed.retry_classification == "RETRYABLE"
+    serialized = json.dumps([record.model_dump(mode="json") for record in scope.provider_calls])
+    assert "synthetic-payload-marker" not in serialized
+    assert "Authorization" not in serialized
 
 
 @pytest.mark.asyncio

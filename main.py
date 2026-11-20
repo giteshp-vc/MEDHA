@@ -15,6 +15,7 @@ from core.orchestrator import MedhaOrchestrator
 from storage.workspace import cleanup_stale_workspaces
 from utils.privacy import storage_mode_context
 from utils.logger import get_logger
+from utils.retry import SAFE_PROVIDER_ERROR_CODES
 
 logger = get_logger("main")
 
@@ -41,6 +42,19 @@ def _console_text(text: Any) -> str:
 
 
 _DIRECT_ANSWER_HEADING = re.compile(r"^#{1,6}\s*direct answer\s*:?\s*$", re.IGNORECASE)
+_SAFE_DIAGNOSTIC_LABEL = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
+_SAFE_DIAGNOSTIC_STAGES = frozenset({
+    "baseline",
+    "claim_extraction",
+    "deliberation",
+    "general",
+    "planning",
+    "repair",
+    "specialist",
+    "specialist_execution",
+    "synthesis",
+    "verification",
+})
 
 
 def _direct_answer(report: str) -> Optional[str]:
@@ -63,6 +77,89 @@ def _answer_for_console(report: str, full: bool) -> str:
     if full:
         return _console_text(report)
     return _console_text(_direct_answer(report) or report)
+
+
+def _safe_diagnostic_label(value: Any) -> str:
+    text = str(value or "")
+    return text if _SAFE_DIAGNOSTIC_LABEL.fullmatch(text) else "unknown"
+
+
+def _print_execution_diagnostics(snapshot: dict) -> None:
+    """Print payload-free telemetry before the execution workspace is cleaned up."""
+    if snapshot.get("diagnostic_phase") == "after_cleanup":
+        mode = _safe_diagnostic_label(snapshot.get("cleanup_mode"))
+        verified = snapshot.get("cleanup_verified")
+        removed = snapshot.get("cleanup_removed")
+        print(
+            f"Post-interruption cleanup: mode={mode}, "
+            f"verified={'yes' if verified is True else 'no' if verified is False else 'unknown'}, "
+            f"removed={'yes' if removed is True else 'no' if removed is False else 'unknown'}"
+        )
+        return
+    print("\n--- Execution Diagnostics (before workspace cleanup) ---")
+    print(f"Pre-cleanup status: {_safe_diagnostic_label(snapshot.get('status'))}")
+    reasons = [
+        _safe_diagnostic_label(reason)
+        for reason in snapshot.get("status_reasons", [])
+        if _SAFE_DIAGNOSTIC_LABEL.fullmatch(str(reason or ""))
+    ]
+    print(f"Status reason(s): {', '.join(reasons) if reasons else 'none recorded'}")
+
+    usage = snapshot.get("token_usage") or {}
+
+    def token_count(name: str) -> str:
+        value = usage.get(name)
+        return f"{value:,}" if isinstance(value, int) and not isinstance(value, bool) else "N/A"
+
+    print(
+        "Tokens (existing tracker totals): "
+        f"input={token_count('prompt_tokens')}, "
+        f"output={token_count('candidate_tokens')}, "
+        f"total={token_count('total_tokens')}, "
+        f"accounted={token_count('accounted_total_tokens')}, "
+        f"source={_safe_diagnostic_label(usage.get('usage_source'))}"
+    )
+
+    records = snapshot.get("provider_call_records") or []
+    counts = {"SUCCEEDED": 0, "FAILED": 0, "TIMED_OUT": 0, "CANCELLED": 0, "IN_PROGRESS": 0}
+    for record in records:
+        status_value = getattr(record.status, "value", record.status)
+        if status_value in counts:
+            counts[status_value] += 1
+    retry_count = sum(
+        1 for record in records
+        if isinstance(getattr(record, "retry_number", None), int) and record.retry_number > 0
+    )
+    dropped = snapshot.get("provider_call_records_dropped", 0)
+    print(
+        f"Provider calls: total={len(records)}, succeeded={counts['SUCCEEDED']}, "
+        f"failed={counts['FAILED']}, timed_out={counts['TIMED_OUT']}, "
+        f"cancelled={counts['CANCELLED']}, retried_attempts={retry_count}, "
+        f"dropped_records={dropped}"
+    )
+
+    for record in records:
+        status_value = getattr(record.status, "value", record.status)
+        is_retry = isinstance(record.retry_number, int) and record.retry_number > 0
+        if status_value == "SUCCEEDED" and not is_retry:
+            continue
+        exception_class = _safe_diagnostic_label(record.error_category) if record.error_category else "none"
+        provider_code = (
+            record.provider_error_code
+            if record.provider_error_code in SAFE_PROVIDER_ERROR_CODES
+            else "N/A"
+        )
+        status_code = record.http_status_code
+        status_code_text = str(status_code) if isinstance(status_code, int) and 100 <= status_code <= 599 else "N/A"
+        retry_limit = record.max_retry_attempts if isinstance(record.max_retry_attempts, int) else "?"
+        retry_classification = _safe_diagnostic_label(record.retry_classification) if record.retry_classification else "N/A"
+        stage = record.stage if record.stage in _SAFE_DIAGNOSTIC_STAGES else "unknown"
+        print(
+            f"  Provider attempt: stage={stage}, status={_safe_diagnostic_label(status_value)}, "
+            f"attempt={record.attempt_number}, retry_attempt={record.retry_number + 1}/{retry_limit}, "
+            f"exception={exception_class}, http_status={status_code_text}, "
+            f"provider_code={provider_code}, retry_classification={retry_classification}"
+        )
 
 
 def _format_rate(val: Any) -> str:
@@ -113,7 +210,10 @@ async def run_interactive_session(full_report: bool = False, persistent: bool = 
             print("----------------------------------------------------------------------\n")
 
             start_time = time.perf_counter()
-            result = await orchestrator.run_task(user_input)
+            result = await orchestrator.run_task(
+                user_input,
+                diagnostics_callback=_print_execution_diagnostics,
+            )
             duration = round(time.perf_counter() - start_time, 2)
 
             print("======================================================================")
@@ -140,12 +240,9 @@ async def run_interactive_session(full_report: bool = False, persistent: bool = 
             print(f"Repair Cycles:         {len(result.repair_history)}")
             print(f"Repair Success Rate:   {_format_rate(rep.get('repair_success_rate', 0.0))}")
 
-            tokens = result.token_usage
-            if tokens:
-                print(f"\nToken Consumption:     {tokens.get('total_tokens', 0):,} total")
-                print(f"  Prompt Tokens:       {tokens.get('prompt_tokens', 0):,}")
-                print(f"  Candidate Tokens:    {tokens.get('candidate_tokens', 0):,}")
-                print(f"  API Requests:        {tokens.get('successful_requests', 0)}")
+            if result.execution_status_reasons:
+                reasons = ", ".join(_safe_diagnostic_label(reason) for reason in result.execution_status_reasons)
+                print(f"Execution status reason(s): {reasons}")
 
             if result.unresolved_questions:
                 print("\nUnresolved Open Risks / Caveats:")
@@ -178,11 +275,15 @@ async def run_single_task(
         documents=documents,
         source_urls=source_urls,
         storage_mode=storage_mode,
+        diagnostics_callback=_print_execution_diagnostics,
     )
     print(_answer_for_console(result.final_answer, full_report))
     print("\n--- Summary ---")
     print(f"Execution ID: {result.execution_id} | Duration: {result.duration_seconds}s | Status: {result.status}")
     print(f"Support Rate: {_format_rate(result.verification_report.get('support_rate', 0.0))}")
+    if result.execution_status_reasons:
+        reasons = ", ".join(_safe_diagnostic_label(reason) for reason in result.execution_status_reasons)
+        print(f"Execution status reason(s): {reasons}")
     if not full_report and result.storage_mode == "persistent":
         print(f"Full report: logs/execution_{result.execution_id}.json (or rerun with --full)")
     elif not full_report:
