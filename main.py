@@ -6,6 +6,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Any, List, Optional
+from urllib.parse import urlsplit
 
 from benchmark.baseline import SingleAgentBaseline
 from benchmark.evaluator import BenchmarkEvaluator
@@ -43,6 +44,10 @@ def _console_text(text: Any) -> str:
 
 _DIRECT_ANSWER_HEADING = re.compile(r"^#{1,6}\s*direct answer\s*:?\s*$", re.IGNORECASE)
 _SAFE_DIAGNOSTIC_LABEL = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
+_SAFE_REFERENCE_IDENTIFIER = re.compile(
+    r"^(?:claim|ev|evidence|chunk|src|source|ref|msg|message|doc|file|benchmark)[_:.-]"
+    r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$"
+)
 _SAFE_DIAGNOSTIC_STAGES = frozenset({
     "baseline",
     "claim_extraction",
@@ -55,6 +60,12 @@ _SAFE_DIAGNOSTIC_STAGES = frozenset({
     "synthesis",
     "verification",
 })
+_SENSITIVE_REFERENCE_PATTERNS = (
+    re.compile(r"AIza[0-9A-Za-z_-]{35}"),
+    re.compile(r"gsk_[A-Za-z0-9]{20,}"),
+    re.compile(r"sk-[A-Za-z0-9]{20,}"),
+    re.compile(r"(?i)bearer\s+\S+"),
+)
 
 
 def _direct_answer(report: str) -> Optional[str]:
@@ -82,6 +93,98 @@ def _answer_for_console(report: str, full: bool) -> str:
 def _safe_diagnostic_label(value: Any) -> str:
     text = str(value or "")
     return text if _SAFE_DIAGNOSTIC_LABEL.fullmatch(text) else "unknown"
+
+
+def _safe_reference_identifier(value: Any) -> Optional[str]:
+    if not isinstance(value, str) or not value or len(value) > 256 or any(char.isspace() for char in value):
+        return None
+    lowered = value.lower()
+    if any(secret_marker in lowered for secret_marker in (
+        "api_key", "apikey", "token=", "password", "secret", "bearer", "authorization",
+    )):
+        return None
+    if any(pattern.search(value) for pattern in _SENSITIVE_REFERENCE_PATTERNS):
+        return None
+    if _SAFE_REFERENCE_IDENTIFIER.fullmatch(value):
+        return value
+    parsed = urlsplit(value)
+    if (
+        parsed.scheme in {"https", "local"}
+        and not parsed.username
+        and not parsed.password
+        and not parsed.query
+        and not parsed.fragment
+        and (parsed.scheme == "local" or bool(parsed.hostname))
+    ):
+        return value
+    return None
+
+
+def _print_deliberation_diagnostics(summary: dict) -> None:
+    def token_value(value: Any) -> str:
+        return f"{value:,}" if isinstance(value, int) and not isinstance(value, bool) else "N/A"
+
+    reason = _safe_diagnostic_label(summary.get("termination_reason"))
+    print(
+        "Deliberation: "
+        f"termination={reason}, claims_considered={summary.get('claims_considered', 0)}, "
+        f"triggers={summary.get('trigger_count', 0)}, "
+        f"suppressed={summary.get('suppressed_trigger_count', 0)}, "
+        f"coalesced_duplicates={summary.get('coalesced_duplicate_trigger_count', 0)}, "
+        f"challenges={summary.get('challenge_count', 0)}, "
+        f"exchanges={summary.get('exchange_count', 0)}, "
+        f"completed_exchanges={summary.get('completed_exchange_count', 0)}, "
+        f"completed_rounds={summary.get('completed_round_count', 0)}, "
+        f"messages={summary.get('total_messages', 0)}, "
+        f"cumulative_tokens={summary.get('total_tokens', 'N/A')}, "
+        f"token_source={_safe_diagnostic_label(summary.get('token_usage_source'))}"
+    )
+    for round_record in summary.get("rounds", []):
+        print(
+            f"  Deliberation round {round_record.get('round_number', '?')}: "
+            f"exchanges={round_record.get('exchange_count', 0)}, "
+            f"messages={round_record.get('message_count', 0)}, "
+            f"incremental_tokens={round_record.get('incremental_tokens', 'N/A')}, "
+            f"cumulative_tokens={round_record.get('cumulative_tokens', 'N/A')}, "
+            f"completed={'yes' if round_record.get('completed') else 'no'}, "
+            f"termination={_safe_diagnostic_label(round_record.get('termination_reason'))}"
+        )
+    for exchange in summary.get("exchanges", []):
+        print(
+            f"  Deliberation exchange: round={exchange.get('round_number', '?')}, "
+            f"type={_safe_diagnostic_label(exchange.get('trigger_type'))}, "
+            f"claim_ref={_safe_diagnostic_label(exchange.get('claim_reference'))}, "
+            f"related_claim_refs={','.join(filter(None, (_safe_diagnostic_label(ref) for ref in exchange.get('related_claim_references', [])))) or 'none'}, "
+            f"source_refs={','.join(filter(None, (_safe_reference_identifier(ref) for ref in exchange.get('source_references', [])))) or 'redacted/none'}, "
+            f"tracker_delta={token_value(exchange.get('tracker_accounted_token_delta'))}, "
+            f"estimated_delta={token_value(exchange.get('tracker_estimated_token_delta'))}, "
+            f"reserved_input={token_value(exchange.get('estimated_input_tokens'))}, "
+            f"reserved_output={token_value(exchange.get('reserved_output_tokens'))}, "
+            f"provider_usage=({token_value(exchange.get('provider_prompt_tokens'))}/"
+            f"{token_value(exchange.get('provider_candidate_tokens'))}/"
+            f"{token_value(exchange.get('provider_total_tokens'))})"
+        )
+        for attempt in exchange.get("attempts", []):
+            code = attempt.get("provider_error_code")
+            code = code if code in SAFE_PROVIDER_ERROR_CODES else "N/A"
+            status_code = attempt.get("http_status_code")
+            status_code = status_code if isinstance(status_code, int) and 100 <= status_code <= 599 else "N/A"
+            print(
+                f"    Deliberation attempt {attempt.get('attempt_number', '?')}: "
+                f"retry={attempt.get('retry_number', 0)}/"
+                f"{attempt.get('max_retry_attempts', '?')}, "
+                f"status={_safe_diagnostic_label(attempt.get('status'))}, "
+                f"reserved=({token_value(attempt.get('reserved_input_tokens'))}/"
+                f"{token_value(attempt.get('reserved_output_tokens'))}/"
+                f"{token_value(attempt.get('reserved_total_tokens'))}), "
+                f"provider_usage=({token_value(attempt.get('provider_prompt_tokens'))}/"
+                f"{token_value(attempt.get('provider_candidate_tokens'))}/"
+                f"{token_value(attempt.get('provider_total_tokens'))}), "
+                f"usage_source={_safe_diagnostic_label(attempt.get('usage_source'))}, "
+                f"exception={_safe_diagnostic_label(attempt.get('error_category'))}, "
+                f"http_status={status_code}, provider_code={code}, "
+                f"retry_classification={_safe_diagnostic_label(attempt.get('retry_classification'))}"
+            )
 
 
 def _print_execution_diagnostics(snapshot: dict) -> None:
@@ -160,6 +263,9 @@ def _print_execution_diagnostics(snapshot: dict) -> None:
             f"exception={exception_class}, http_status={status_code_text}, "
             f"provider_code={provider_code}, retry_classification={retry_classification}"
         )
+    deliberation = snapshot.get("deliberation")
+    if deliberation is not None:
+        _print_deliberation_diagnostics(deliberation)
 
 
 def _format_rate(val: Any) -> str:

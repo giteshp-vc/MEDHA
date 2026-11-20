@@ -145,6 +145,27 @@ class DeliberationPolicy:
                 return
             if claim_reference and exchanges_by_claim.get(claim_reference, 0) >= self.max_exchanges_per_claim:
                 return
+            if trigger_type == DeliberationTriggerType.UNSUPPORTED_EMPIRICAL_CLAIM:
+                normalized_text = self._normalize_exact_text(claim_text or reason)
+                source_references = self._source_reference_identifiers(source, target)
+                duplicate = next((
+                    existing for existing in triggers
+                    if existing.trigger_type == trigger_type
+                    and existing.source_agent_id == source.agent_id
+                    and existing.target_agent_id == target.agent_id
+                    and self._normalize_exact_text(existing.related_claim_text or existing.reason) == normalized_text
+                ), None)
+                if duplicate is not None:
+                    if (
+                        claim_reference
+                        and claim_reference != duplicate.claim_reference
+                        and claim_reference not in duplicate.related_claim_references
+                    ):
+                        duplicate.related_claim_references.append(claim_reference)
+                    for reference in source_references:
+                        if reference not in duplicate.source_references:
+                            duplicate.source_references.append(reference)
+                    return
             key = self._trigger_key(trigger_type, claim_reference, source.agent_id, target.agent_id)
             if key in existing_keys or any(
                 self._trigger_key(item.trigger_type, item.claim_reference, item.source_agent_id, item.target_agent_id) == key
@@ -173,6 +194,7 @@ class DeliberationPolicy:
                     target_agent_id=target.agent_id,
                     source_subtask_id=source.subtask_id,
                     target_subtask_id=target.subtask_id,
+                    source_references=self._source_reference_identifiers(source, target),
                     reason=reason,
                     target_selection_rationale=target_rationale,
                     related_claim_text=claim_text,
@@ -300,6 +322,24 @@ class DeliberationPolicy:
                     )
 
         return triggers
+
+    @staticmethod
+    def _normalize_exact_text(text: str) -> str:
+        """Normalize only case and whitespace; this is not fuzzy claim matching."""
+        return " ".join((text or "").split()).casefold()
+
+    @staticmethod
+    def _source_reference_identifiers(*results: TaskResult) -> List[str]:
+        references: List[str] = []
+        for result in results:
+            for item in result.evidence_items:
+                if not isinstance(item, dict):
+                    continue
+                for key in ("reference", "evidence_id", "chunk_id", "source_reference", "source_identifier"):
+                    value = item.get(key)
+                    if isinstance(value, str) and value.strip() and value not in references:
+                        references.append(value)
+        return references
 
     @staticmethod
     def _trigger_key(

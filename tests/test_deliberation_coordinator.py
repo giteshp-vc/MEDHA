@@ -14,8 +14,16 @@ from models.deliberation_models import (
     DeliberationTrigger,
     DeliberationTriggerType,
 )
+from models.provider_call import ProviderCallStatus
 from models.schemas import TaskStatus
 from models.task_models import SubTask, TaskPlan, TaskResult
+from utils.retry import (
+    LLMBudgetExceededError,
+    LLMRateLimitError,
+    LLMTimeoutError,
+    LLMTokenBudgetExceededError,
+    execute_with_retry,
+)
 from utils.token_tracker import TokenTracker
 
 
@@ -135,6 +143,44 @@ def make_coordinator(client, policy, **kwargs):
     return coordinator, bus, tracker, source, target
 
 
+def make_hanging_tracked_coordinator(timeout_seconds):
+    coordinator, _, tracker, _, target = make_coordinator(
+        MagicMock(),
+        StaticPolicy([make_trigger()]),
+        timeout_seconds=timeout_seconds,
+    )
+    started = asyncio.Event()
+
+    async def hang(**kwargs):
+        estimated_input = tracker.estimate_tokens(kwargs["prompt"] + kwargs["system_instruction"])
+        async with tracker.track_call(
+            estimated_input_tokens=estimated_input,
+            max_output_tokens=kwargs["max_tokens"],
+        ):
+            async with tracker.provider_call(
+                attempt_number=1,
+                retry_number=0,
+                max_retry_attempts=1,
+                provider="gemini",
+                model="target-model",
+                model_version=None,
+                temperature=kwargs["temperature"],
+                input_token_limit=tracker.max_input_tokens_per_call,
+                output_token_limit=kwargs["max_tokens"],
+                timeout_seconds=kwargs["timeout_seconds"],
+                estimated_prompt_tokens=estimated_input,
+            ):
+                started.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    await tracker.record_failure()
+                    raise
+
+    target.client.generate_structured = AsyncMock(side_effect=hang)
+    return coordinator, tracker, started
+
+
 @pytest.mark.asyncio
 async def test_no_triggers_make_no_provider_calls():
     client = MagicMock()
@@ -176,6 +222,14 @@ async def test_challenge_targets_only_intended_agent_without_rerunning_execute()
     call = client.generate_structured.await_args.kwargs
     assert call["model"] == "target-model"
     assert call["temperature"] == 0.1
+    prompt = call["prompt"]
+    assert prompt.count("CONFLICTING_CLAIMS") == 1
+    assert prompt.count("Database read latency target is 50ms.") == 1
+    legacy_prompt = prompt.replace(
+        "Request: Conflicting related claims.",
+        "Request: CONFLICTING_CLAIMS: Conflicting related claims.",
+    )
+    assert coordinator.token_tracker.estimate_tokens(legacy_prompt) > coordinator.token_tracker.estimate_tokens(prompt)
     source.execute.assert_not_called()
     target.execute.assert_not_called()
     assert len(report.exchanges) == 1
@@ -185,6 +239,28 @@ async def test_challenge_targets_only_intended_agent_without_rerunning_execute()
     assert messages[0].sender_id == "agent_source"
     assert messages[1].sender_id == "agent_target"
     assert messages[1].reply_to_message_id == messages[0].message_id
+
+
+@pytest.mark.asyncio
+async def test_coalesced_claim_references_reach_request_prompt_and_exchange_report():
+    trigger = make_trigger()
+    trigger.related_claim_references = ["claim:exec_coord:T1:1"]
+    trigger.source_references = ["ev_source_1", "local://guide.pdf"]
+    client = MagicMock()
+    client.generate_structured = AsyncMock(return_value=make_response(trigger))
+    coordinator, bus, _, _, _ = make_coordinator(client, StaticPolicy([trigger]))
+
+    report = await coordinator.run()
+
+    request = bus.get_history(task_id="exec_coord")[0]
+    assert request.claim_references == [trigger.claim_reference, "claim:exec_coord:T1:1"]
+    assert request.evidence_references == trigger.source_references
+    assert "Related exact claim references: claim:exec_coord:T1:1" in client.generate_structured.await_args.kwargs["prompt"]
+    assert "ev_source_1" in client.generate_structured.await_args.kwargs["prompt"]
+    assert "local://guide.pdf" in client.generate_structured.await_args.kwargs["prompt"]
+    assert report.exchanges[0].related_claim_references == ["claim:exec_coord:T1:1"]
+    assert report.exchanges[0].source_references == trigger.source_references
+    assert report.coalesced_duplicate_trigger_count == 1
 
 
 @pytest.mark.asyncio
@@ -376,7 +452,32 @@ async def test_token_budget_exhaustion_stops_provider_call():
 
     assert report.exchanges[0].response_message_id is None
     assert "token budget" in report.exchanges[0].diagnostic.lower()
+    assert report.termination_reason == DeliberationTerminationReason.TOKEN_BUDGET_EXHAUSTED
     client.generate_structured.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("error", "reason"),
+    [
+        (LLMTokenBudgetExceededError("private task budget detail"), DeliberationTerminationReason.TASK_BUDGET_EXHAUSTED),
+        (LLMBudgetExceededError("private call budget detail"), DeliberationTerminationReason.CALL_BUDGET_EXHAUSTED),
+        (LLMRateLimitError("private provider detail", status_code=429), DeliberationTerminationReason.PROVIDER_FAILURE),
+    ],
+)
+@pytest.mark.asyncio
+async def test_external_budget_and_provider_termination_reasons_are_distinct(error, reason):
+    trigger = make_trigger()
+    client = MagicMock()
+    client.generate_structured = AsyncMock(side_effect=error)
+    coordinator, _, _, _, _ = make_coordinator(client, StaticPolicy([trigger]))
+
+    report = await coordinator.run()
+
+    assert report.termination_reason == reason
+    serialized = str(report.model_dump(mode="json"))
+    assert "private task budget detail" not in serialized
+    assert "private call budget detail" not in serialized
+    assert "private provider detail" not in serialized
 
 
 @pytest.mark.asyncio
@@ -402,6 +503,79 @@ async def test_provider_usage_is_reconciled_and_estimates_are_preserved():
 
     assert report.total_tokens == 5
     assert "provider" in tracker.get_summary_sync()["usage_source"]
+    assert report.rounds[0].token_count == report.total_tokens
+    assert report.rounds[0].cumulative_token_count == report.total_tokens
+    exchange = report.exchanges[0]
+    assert exchange.tracker_accounted_token_delta == report.total_tokens
+    assert exchange.provider_attempts == []
+
+
+@pytest.mark.asyncio
+async def test_failed_429_reservation_and_successful_retry_usage_are_separate():
+    trigger = make_trigger()
+    client = MagicMock()
+    coordinator, _, tracker, _, _ = make_coordinator(client, StaticPolicy([trigger]))
+    attempt_number = 0
+
+    async def generate(**kwargs):
+        async def send_one_attempt():
+            nonlocal attempt_number
+            attempt_number += 1
+            estimated_input = tracker.estimate_tokens(kwargs["prompt"] + kwargs["system_instruction"])
+            async with tracker.track_call(
+                estimated_input_tokens=estimated_input,
+                max_output_tokens=kwargs["max_tokens"],
+            ):
+                async with tracker.provider_call(
+                    attempt_number=attempt_number,
+                    retry_number=attempt_number - 1,
+                    max_retry_attempts=2,
+                    provider="groq",
+                    model="mock-model",
+                    model_version=None,
+                    temperature=kwargs["temperature"],
+                    input_token_limit=tracker.max_input_tokens_per_call,
+                    output_token_limit=kwargs["max_tokens"],
+                    timeout_seconds=kwargs["timeout_seconds"],
+                    estimated_prompt_tokens=estimated_input,
+                ) as recorder:
+                    if attempt_number == 1:
+                        await tracker.record_failure()
+                        raise LLMRateLimitError("synthetic 429", status_code=429)
+                    recorder.set_provider_usage(100, 50, 150)
+                    await tracker.add_usage(
+                        prompt_tokens=100,
+                        candidate_tokens=50,
+                        total_tokens=150,
+                        usage_available=True,
+                    )
+                    return make_response(trigger)
+
+        return await execute_with_retry(send_one_attempt, max_retries=1, initial_delay=0, max_delay=0)
+
+    client.generate_structured = AsyncMock(side_effect=generate)
+    report = await coordinator.run()
+
+    exchange = report.exchanges[0]
+    assert report.termination_reason == DeliberationTerminationReason.RESOLVED
+    assert len(exchange.provider_attempts) == 2
+    failed, succeeded = exchange.provider_attempts
+    assert [
+        str(getattr(attempt.status, "value", attempt.status))
+        for attempt in exchange.provider_attempts
+    ] == ["FAILED", "SUCCEEDED"]
+    assert [attempt.retry_number for attempt in exchange.provider_attempts] == [0, 1]
+    assert all(attempt.max_retry_attempts == 2 for attempt in exchange.provider_attempts)
+    assert failed.reserved_total_tokens == failed.reserved_input_tokens + failed.reserved_output_tokens
+    assert failed.provider_total_tokens is None
+    assert succeeded.provider_prompt_tokens == 100
+    assert succeeded.provider_candidate_tokens == 50
+    assert succeeded.provider_total_tokens == 150
+    assert exchange.tracker_estimated_token_delta == failed.reserved_total_tokens
+    assert exchange.tracker_accounted_token_delta == report.total_tokens
+    assert report.total_tokens == tracker.get_summary_sync()["accounted_total_tokens"]
+    assert tracker.get_summary_sync()["provider_usage_requests"] == 1
+    assert tracker.get_summary_sync()["failed_requests"] == 1
 
 
 @pytest.mark.asyncio
@@ -479,6 +653,19 @@ async def test_timeout_preserves_completed_exchanges():
 
 
 @pytest.mark.asyncio
+async def test_exhausted_provider_retry_timeout_has_explicit_timeout_reason():
+    trigger = make_trigger()
+    client = MagicMock()
+    client.generate_structured = AsyncMock(side_effect=LLMTimeoutError("provider timeout detail"))
+    coordinator, _, _, _, _ = make_coordinator(client, StaticPolicy([trigger]))
+
+    report = await coordinator.run()
+
+    assert report.termination_reason == DeliberationTerminationReason.TIMEOUT
+    assert "provider timeout detail" not in " ".join(report.diagnostics)
+
+
+@pytest.mark.asyncio
 async def test_agent_failure_preserves_previous_exchange():
     first = make_trigger("exchange_1")
     second = make_trigger("exchange_2")
@@ -513,6 +700,39 @@ async def test_cancellation_returns_cancelled_report():
     report = await task
 
     assert report.termination_reason == DeliberationTerminationReason.TASK_CANCELLED
+    assert report.exchange_count == 1
+    assert report.completed_exchange_count == 0
+    assert report.rounds[0].completed is False
+    assert report.rounds[0].token_count is not None
+    assert report.rounds[0].cumulative_token_count == report.total_tokens
+    assert "PRIVATE" not in str(report.model_dump(mode="json"))
+
+
+@pytest.mark.asyncio
+async def test_coordinator_deadline_marks_provider_attempt_timed_out():
+    coordinator, tracker, started = make_hanging_tracked_coordinator(timeout_seconds=0.05)
+
+    report = await coordinator.run()
+
+    assert started.is_set()
+    assert report.termination_reason == DeliberationTerminationReason.TIMEOUT
+    assert len(report.exchanges[0].provider_attempts) == 1
+    assert report.exchanges[0].provider_attempts[0].status == ProviderCallStatus.TIMED_OUT
+    assert tracker.get_provider_call_records("exec_coord")[0].status == ProviderCallStatus.TIMED_OUT
+
+
+@pytest.mark.asyncio
+async def test_user_cancellation_keeps_provider_attempt_cancelled():
+    coordinator, tracker, started = make_hanging_tracked_coordinator(timeout_seconds=5.0)
+    task = asyncio.create_task(coordinator.run())
+    await started.wait()
+    task.cancel()
+
+    report = await task
+
+    assert report.termination_reason == DeliberationTerminationReason.TASK_CANCELLED
+    assert report.exchanges[0].provider_attempts[0].status == ProviderCallStatus.CANCELLED
+    assert tracker.get_provider_call_records("exec_coord")[0].status == ProviderCallStatus.CANCELLED
 
 
 @pytest.mark.asyncio
@@ -694,6 +914,22 @@ async def test_response_introduced_contradiction_targets_original_claim_owner():
     assert any(
         suppression.originating_response_message_id == report.exchanges[0].response_message_id
         for suppression in report.suppressed_triggers
+    )
+    assert report.claims_considered == 3
+    assert report.trigger_count == len(report.triggers)
+    assert report.exchange_count == len(report.exchanges)
+    assert report.completed_exchange_count == len(report.exchanges)
+    assert report.challenge_count == sum(
+        trigger.trigger_type == DeliberationTriggerType.CONFLICTING_CLAIMS
+        for trigger in report.triggers
+    )
+    assert report.completed_round_count == len(report.rounds)
+    assert sum(round_record.token_count or 0 for round_record in report.rounds) == report.total_tokens
+    assert all(
+        round_record.cumulative_token_count is not None
+        and round_record.token_count is not None
+        and round_record.cumulative_token_count >= round_record.token_count
+        for round_record in report.rounds
     )
     assert len(policy_calls) >= 2
     assert "agent_unrelated" not in policy_calls[1]

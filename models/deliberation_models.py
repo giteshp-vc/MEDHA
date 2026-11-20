@@ -4,6 +4,7 @@ from typing import Dict, List, Optional
 from pydantic import Field
 
 from models.schemas import BaseSchema
+from models.provider_call import ProviderCallStatus, ProviderUsageSource
 from utils.helpers import generate_id, utcnow_iso
 
 
@@ -36,7 +37,10 @@ class DeliberationTerminationReason(str, Enum):
     MAX_EXCHANGES_REACHED = "MAX_EXCHANGES_REACHED"
     MESSAGE_BUDGET_EXHAUSTED = "MESSAGE_BUDGET_EXHAUSTED"
     TOKEN_BUDGET_EXHAUSTED = "TOKEN_BUDGET_EXHAUSTED"
+    TASK_BUDGET_EXHAUSTED = "TASK_BUDGET_EXHAUSTED"
+    CALL_BUDGET_EXHAUSTED = "CALL_BUDGET_EXHAUSTED"
     TIMEOUT = "TIMEOUT"
+    PROVIDER_FAILURE = "PROVIDER_FAILURE"
     AGENT_FAILURE = "AGENT_FAILURE"
     TASK_CANCELLED = "TASK_CANCELLED"
     UNRESOLVED_DISAGREEMENT = "UNRESOLVED_DISAGREEMENT"
@@ -60,6 +64,8 @@ class DeliberationTrigger(BaseSchema):
     target_agent_id: str
     source_subtask_id: str
     target_subtask_id: Optional[str] = None
+    related_claim_references: List[str] = Field(default_factory=list)
+    source_references: List[str] = Field(default_factory=list)
     reason: str
     target_selection_rationale: str = ""
     originating_response_message_id: Optional[str] = None
@@ -94,6 +100,27 @@ class DeliberationResponsePayload(BaseSchema):
     disagreement: bool = False
 
 
+class DeliberationProviderAttempt(BaseSchema):
+    """One provider wire attempt's reservation and actual usage, without request content."""
+
+    call_id: str
+    attempt_number: int
+    retry_number: int = 0
+    max_retry_attempts: Optional[int] = None
+    status: ProviderCallStatus
+    reserved_input_tokens: Optional[int] = None
+    reserved_output_tokens: Optional[int] = None
+    reserved_total_tokens: Optional[int] = None
+    provider_prompt_tokens: Optional[int] = None
+    provider_candidate_tokens: Optional[int] = None
+    provider_total_tokens: Optional[int] = None
+    usage_source: ProviderUsageSource = ProviderUsageSource.UNAVAILABLE
+    error_category: Optional[str] = None
+    http_status_code: Optional[int] = None
+    provider_error_code: Optional[str] = None
+    retry_classification: Optional[str] = None
+
+
 class DeliberationExchange(BaseSchema):
     """Audit record for one trigger and its optional response."""
 
@@ -101,10 +128,22 @@ class DeliberationExchange(BaseSchema):
     execution_id: str
     correlation_id: str
     claim_reference: Optional[str] = None
+    related_claim_references: List[str] = Field(default_factory=list)
+    source_references: List[str] = Field(default_factory=list)
     trigger_type: DeliberationTriggerType
     round_number: int = 1
     initiator_agent_id: str
     target_agent_id: str
+    estimated_input_tokens: Optional[int] = None
+    reserved_output_tokens: Optional[int] = None
+    reserved_total_tokens: Optional[int] = None
+    tracker_accounted_token_delta: Optional[int] = None
+    tracker_estimated_token_delta: Optional[int] = None
+    provider_prompt_tokens: Optional[int] = None
+    provider_candidate_tokens: Optional[int] = None
+    provider_total_tokens: Optional[int] = None
+    provider_usage_source: Optional[ProviderUsageSource] = None
+    provider_attempts: List[DeliberationProviderAttempt] = Field(default_factory=list)
     request_message_id: Optional[str] = None
     response_message_id: Optional[str] = None
     response_type: Optional[DeliberationResponseType] = None
@@ -129,7 +168,9 @@ class DeliberationRound(BaseSchema):
     round_number: int
     exchange_ids: List[str] = Field(default_factory=list)
     message_count: int = 0
-    token_count: Optional[int] = None
+    token_count: Optional[int] = None  # Incremental accounted tokens for this round.
+    cumulative_token_count: Optional[int] = None
+    completed: bool = False
     termination_reason: Optional[DeliberationTerminationReason] = None
 
 
@@ -159,8 +200,17 @@ class DeliberationReport(BaseSchema):
     unresolved_questions: List[str] = Field(default_factory=list)
     diagnostics: List[str] = Field(default_factory=list)
     termination_reason: Optional[DeliberationTerminationReason] = None
+    claims_considered: int = 0
+    trigger_count: int = 0
+    suppressed_trigger_count: int = 0
+    coalesced_duplicate_trigger_count: int = 0
+    exchange_count: int = 0
+    completed_exchange_count: int = 0
+    challenge_count: int = 0
+    completed_round_count: int = 0
     total_messages: int = 0
-    total_tokens: Optional[int] = None
+    total_tokens: Optional[int] = None  # Cumulative usage reconciled from TokenTracker.
+    token_usage_source: str = "unknown"
 
 
 __all__ = [

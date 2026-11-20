@@ -224,6 +224,80 @@ class MedhaOrchestrator:
             result.execution_status_reasons.append(reason)
 
     @staticmethod
+    def _deliberation_diagnostic_summary(report: Optional[DeliberationReport]) -> Optional[Dict[str, Any]]:
+        if report is None:
+            return None
+
+        def enum_value(value: Any) -> Optional[str]:
+            return getattr(value, "value", value) if value is not None else None
+
+        return {
+            "termination_reason": enum_value(report.termination_reason),
+            "claims_considered": report.claims_considered,
+            "trigger_count": report.trigger_count,
+            "suppressed_trigger_count": report.suppressed_trigger_count,
+            "coalesced_duplicate_trigger_count": report.coalesced_duplicate_trigger_count,
+            "challenge_count": report.challenge_count,
+            "exchange_count": report.exchange_count,
+            "completed_exchange_count": report.completed_exchange_count,
+            "completed_round_count": report.completed_round_count,
+            "total_messages": report.total_messages,
+            "total_tokens": report.total_tokens,
+            "token_usage_source": report.token_usage_source,
+            "rounds": [
+                {
+                    "round_number": round_record.round_number,
+                    "exchange_count": len(round_record.exchange_ids),
+                    "message_count": round_record.message_count,
+                    "incremental_tokens": round_record.token_count,
+                    "cumulative_tokens": round_record.cumulative_token_count,
+                    "completed": round_record.completed,
+                    "termination_reason": enum_value(round_record.termination_reason),
+                }
+                for round_record in report.rounds
+            ],
+            "exchanges": [
+                {
+                    "round_number": exchange.round_number,
+                    "trigger_type": enum_value(exchange.trigger_type),
+                    "claim_reference": exchange.claim_reference,
+                    "related_claim_references": list(exchange.related_claim_references),
+                    "source_references": list(exchange.source_references),
+                    "tracker_accounted_token_delta": exchange.tracker_accounted_token_delta,
+                    "tracker_estimated_token_delta": exchange.tracker_estimated_token_delta,
+                    "estimated_input_tokens": exchange.estimated_input_tokens,
+                    "reserved_output_tokens": exchange.reserved_output_tokens,
+                    "reserved_total_tokens": exchange.reserved_total_tokens,
+                    "provider_prompt_tokens": exchange.provider_prompt_tokens,
+                    "provider_candidate_tokens": exchange.provider_candidate_tokens,
+                    "provider_total_tokens": exchange.provider_total_tokens,
+                    "provider_usage_source": enum_value(exchange.provider_usage_source),
+                    "attempts": [
+                        {
+                            "attempt_number": attempt.attempt_number,
+                            "retry_number": attempt.retry_number,
+                            "max_retry_attempts": attempt.max_retry_attempts,
+                            "status": enum_value(attempt.status),
+                            "reserved_input_tokens": attempt.reserved_input_tokens,
+                            "reserved_output_tokens": attempt.reserved_output_tokens,
+                            "reserved_total_tokens": attempt.reserved_total_tokens,
+                            "provider_prompt_tokens": attempt.provider_prompt_tokens,
+                            "provider_candidate_tokens": attempt.provider_candidate_tokens,
+                            "provider_total_tokens": attempt.provider_total_tokens,
+                            "usage_source": enum_value(attempt.usage_source),
+                            "error_category": attempt.error_category,
+                            "http_status_code": attempt.http_status_code,
+                            "provider_error_code": attempt.provider_error_code,
+                            "retry_classification": attempt.retry_classification,
+                        }
+                        for attempt in exchange.provider_attempts
+                    ],
+                }
+                for exchange in report.exchanges
+            ],
+        }
+
+    @staticmethod
     def _emit_diagnostics_callback(
         callback: Optional[Callable[[Dict[str, Any]], None]],
         result: Optional[MedhaResult],
@@ -254,6 +328,10 @@ class MedhaOrchestrator:
             "provider_call_records_dropped": (
                 result.provider_call_records_dropped if result
                 else tracker.get_provider_call_records_dropped()
+            ),
+            "deliberation": (
+                MedhaOrchestrator._deliberation_diagnostic_summary(result.deliberation_report)
+                if result else None
             ),
             "cleanup_mode": cleanup_result.mode if cleanup_result else None,
             "cleanup_verified": cleanup_result.verified if cleanup_result else None,
@@ -769,9 +847,14 @@ class MedhaOrchestrator:
                 if deliberation_report.termination_reason in {
                     DeliberationTerminationReason.AGENT_FAILURE,
                     DeliberationTerminationReason.TOKEN_BUDGET_EXHAUSTED,
+                    DeliberationTerminationReason.TASK_BUDGET_EXHAUSTED,
+                    DeliberationTerminationReason.CALL_BUDGET_EXHAUSTED,
                     DeliberationTerminationReason.TIMEOUT,
+                    DeliberationTerminationReason.PROVIDER_FAILURE,
                     DeliberationTerminationReason.TASK_CANCELLED,
                     DeliberationTerminationReason.MESSAGE_BUDGET_EXHAUSTED,
+                    DeliberationTerminationReason.MAX_ROUNDS_REACHED,
+                    DeliberationTerminationReason.MAX_EXCHANGES_REACHED,
                 } and deliberation_report.triggered:
                     termination_reason = getattr(
                         deliberation_report.termination_reason,

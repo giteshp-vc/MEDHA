@@ -4,6 +4,8 @@ import logging
 import os
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
+from contextlib import redirect_stdout
+from io import StringIO
 
 import pytest
 
@@ -13,6 +15,15 @@ from core.providers.gemini_client import GeminiClient
 from models.provider_call import ProviderCallRecord, ProviderCallStatus
 from storage.workspace import ExecutionWorkspace, ExecutionWorkspaceManager, _pid_alive
 from utils.logger import ExecutionRecord
+from models.deliberation_models import (
+    DeliberationExchange,
+    DeliberationProviderAttempt,
+    DeliberationReport,
+    DeliberationRound,
+    DeliberationResponseType,
+    DeliberationTerminationReason,
+    DeliberationTriggerType,
+)
 from utils.privacy import storage_mode_context
 from config.logging_config import CredentialRedactingFormatter
 from utils.token_tracker import TokenTracker
@@ -42,6 +53,117 @@ def test_ephemeral_workspaces_are_isolated_and_removed(tmp_path):
     assert second_result.verified is True
     assert not first.path.exists()
     assert not second.path.exists()
+
+
+def test_deliberation_cli_summary_contains_usage_but_not_prompt_or_response_text():
+    from main import _print_execution_diagnostics
+
+    report = DeliberationReport(
+        execution_id="exec-private-summary",
+        triggered=True,
+        termination_reason=DeliberationTerminationReason.TOKEN_BUDGET_EXHAUSTED,
+        claims_considered=4,
+        trigger_count=3,
+        suppressed_trigger_count=1,
+        challenge_count=2,
+        exchange_count=2,
+        completed_exchange_count=1,
+        completed_round_count=1,
+        total_messages=3,
+        total_tokens=4095,
+        token_usage_source="mixed",
+        rounds=[
+            DeliberationRound(
+                execution_id="exec-private-summary",
+                round_number=1,
+                exchange_ids=["exchange_1", "exchange_2"],
+                message_count=3,
+                token_count=4095,
+                cumulative_token_count=4095,
+                completed=False,
+                termination_reason=DeliberationTerminationReason.TOKEN_BUDGET_EXHAUSTED,
+            )
+        ],
+        exchanges=[
+            DeliberationExchange(
+                exchange_id="exchange_1",
+                execution_id="exec-private-summary",
+                correlation_id="corr_1",
+                trigger_type=DeliberationTriggerType.CONFLICTING_CLAIMS,
+                round_number=1,
+                initiator_agent_id="agent_source",
+                target_agent_id="agent_target",
+                claim_reference="claim:exec-private:T1:0",
+                related_claim_references=["claim:exec-private:T1:1"],
+                source_references=[
+                    "ev_source_1",
+                    "local://guide.pdf",
+                    "https://docs.example.org/guide",
+                    "https://docs.example.org/private?token=secret",
+                    "src_api_key_marker",
+                    "https://docs.example.org/path/authorization-header-marker",
+                    "PRIVATE_SOURCE_TEXT_MARKER",
+                ],
+                response_type=DeliberationResponseType.DISAGREEMENT,
+                response_content="PRIVATE_RESPONSE_BODY_MARKER",
+                diagnostic="PRIVATE_PROMPT_DIAGNOSTIC_MARKER",
+                tracker_accounted_token_delta=4095,
+                tracker_estimated_token_delta=3000,
+                estimated_input_tokens=900,
+                reserved_output_tokens=2048,
+                reserved_total_tokens=2948,
+                provider_prompt_tokens=100,
+                provider_candidate_tokens=50,
+                provider_total_tokens=150,
+                provider_attempts=[
+                    DeliberationProviderAttempt(
+                        call_id="call_1",
+                        attempt_number=1,
+                        retry_number=0,
+                        max_retry_attempts=2,
+                        status=ProviderCallStatus.FAILED,
+                        reserved_input_tokens=900,
+                        reserved_output_tokens=2048,
+                        reserved_total_tokens=2948,
+                        error_category="LLMRateLimitError",
+                        http_status_code=429,
+                        provider_error_code="rate_limit_exceeded",
+                        retry_classification="RETRYABLE",
+                    )
+                ],
+            )
+        ],
+    )
+    summary = MedhaOrchestrator._deliberation_diagnostic_summary(report)
+    output = StringIO()
+    with redirect_stdout(output):
+        _print_execution_diagnostics({
+            "status": "PARTIAL_FAILURE",
+            "status_reasons": ["deliberation_incomplete_token_budget_exhausted"],
+            "token_usage": {"prompt_tokens": 100, "candidate_tokens": 50, "total_tokens": 150},
+            "provider_call_records": [],
+            "provider_call_records_dropped": 0,
+            "deliberation": summary,
+        })
+
+    rendered = output.getvalue()
+    assert "claims_considered=4" in rendered
+    assert "incremental_tokens=4095" in rendered
+    assert "cumulative_tokens=4095" in rendered
+    assert "reserved=(900/2,048/2,948)" in rendered
+    assert "claim_ref=claim:exec-private:T1:0" in rendered
+    assert "related_claim_refs=claim:exec-private:T1:1" in rendered
+    assert "source_refs=ev_source_1,local://guide.pdf,https://docs.example.org/guide" in rendered
+    assert "token=secret" not in rendered
+    assert "src_api_key_marker" not in rendered
+    assert "authorization-header-marker" not in rendered
+    assert "PRIVATE_SOURCE_TEXT_MARKER" not in rendered
+    assert "provider_usage=(100/50/150)" in rendered
+    assert "provider_usage=(N/A/N/A/N/A)" in rendered
+    assert "http_status=429" in rendered
+    assert "provider_code=rate_limit_exceeded" in rendered
+    assert "PRIVATE_RESPONSE_BODY_MARKER" not in rendered
+    assert "PRIVATE_PROMPT_DIAGNOSTIC_MARKER" not in rendered
 
 
 def test_ephemeral_cleanup_is_idempotent(tmp_path):

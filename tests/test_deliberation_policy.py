@@ -133,6 +133,104 @@ def test_unsupported_empirical_claim_triggers_evidence_request():
     )
 
 
+def test_exact_duplicate_empirical_claim_triggers_coalesce_and_preserve_references():
+    plan = make_plan(
+        SubTask(id="T1", role="Performance Architect", objective="Analyze database read latency"),
+        SubTask(id="T2", role="Reliability Engineer", objective="Analyze database read latency"),
+    )
+    results = [
+        result(
+            "T1", "agent_a", "Performance Architect",
+            output="database read latency evidence review",
+            claims=[
+                "We measured database read latency at 50ms.",
+                "  WE measured database read latency at 50ms.  ",
+            ],
+        ),
+        result("T2", "agent_b", "Reliability Engineer", output="database read latency evidence review"),
+    ]
+
+    report = DeliberationPolicy().evaluate("exec_test", plan, results)
+    empirical = [
+        trigger for trigger in report.triggers
+        if trigger.trigger_type == DeliberationTriggerType.UNSUPPORTED_EMPIRICAL_CLAIM
+    ]
+
+    assert len(empirical) == 1
+    assert empirical[0].claim_reference == temporary_claim_reference("exec_test", "T1", 0)
+    assert empirical[0].related_claim_references == [
+        temporary_claim_reference("exec_test", "T1", 1)
+    ]
+
+
+def test_different_numeric_claims_and_source_agents_are_not_coalesced():
+    plan = make_plan(
+        SubTask(id="T1", role="Performance Architect", objective="Analyze database read latency"),
+        SubTask(id="T2", role="Reliability Engineer", objective="Analyze database read latency"),
+        SubTask(id="T3", role="Platform Engineer", objective="Analyze database read latency"),
+    )
+    results = [
+        result(
+            "T1", "agent_a", "Performance Architect",
+            output="database read latency evidence review",
+            claims=[
+                "We measured database read latency at 50ms.",
+                "We measured database read latency at 200ms.",
+            ],
+        ),
+        result(
+            "T2", "agent_b", "Reliability Engineer",
+            output="database read latency evidence review",
+            claims=["We measured database read latency at 50ms."],
+        ),
+        result("T3", "agent_c", "Platform Engineer", output="database read latency evidence review"),
+    ]
+
+    report = DeliberationPolicy().evaluate("exec_test", plan, results)
+    empirical = [
+        trigger for trigger in report.triggers
+        if trigger.trigger_type == DeliberationTriggerType.UNSUPPORTED_EMPIRICAL_CLAIM
+    ]
+
+    assert len(empirical) == 3
+    assert all(not trigger.related_claim_references for trigger in empirical)
+
+
+def test_repeated_conflicting_claims_remain_separate_challenges():
+    plan = make_plan(
+        SubTask(id="T1", role="Performance Architect", objective="Analyze database read latency"),
+        SubTask(id="T2", role="Reliability Engineer", objective="Analyze database read latency"),
+    )
+    results = [
+        result(
+            "T1", "agent_a", "Performance Architect",
+            output="database read latency analysis",
+            claims=[
+                "Database read latency target is 50ms.",
+                "Database read latency target is 50ms.",
+            ],
+        ),
+        result(
+            "T2", "agent_b", "Reliability Engineer",
+            output="database read latency analysis",
+            claims=["Database read latency target is 200ms."],
+        ),
+    ]
+
+    report = DeliberationPolicy().evaluate("exec_test", plan, results)
+    conflicting = [
+        trigger for trigger in report.triggers
+        if trigger.trigger_type == DeliberationTriggerType.CONFLICTING_CLAIMS
+    ]
+
+    assert len(conflicting) == 2
+    assert [trigger.claim_reference for trigger in conflicting] == [
+        temporary_claim_reference("exec_test", "T1", 0),
+        temporary_claim_reference("exec_test", "T1", 1),
+    ]
+    assert all(not trigger.related_claim_references for trigger in conflicting)
+
+
 def test_material_assumption_triggers_clarification():
     plan = make_plan(
         SubTask(id="T1", role="Architecture Specialist", objective="Design database network latency controls"),

@@ -423,6 +423,29 @@ class TokenTracker:
             records = [record for record in records if record.execution_id == execution_id]
         return records
 
+    def mark_cancelled_provider_calls_timed_out(self, call_ids: set[str]) -> None:
+        """Reclassify only cancelled attempts known to belong to an expired outer request deadline."""
+        if not call_ids:
+            return
+        effective = self._effective_tracker()
+        if effective is not self:
+            effective.mark_cancelled_provider_calls_timed_out(call_ids)
+            return
+        scope = _active_accounting_scope.get()
+        records = (
+            list(scope.records)
+            if scope is not None and scope.tracker is self
+            else list(self._provider_call_records)
+        )
+        for record in records:
+            if record.call_id not in call_ids or record.status != ProviderCallStatus.CANCELLED:
+                continue
+            record.status = ProviderCallStatus.TIMED_OUT
+            record.error_category = "LLMTimeoutError"
+            record.http_status_code = 408
+            record.retry_classification = "RETRYABLE"
+            record.sanitized_error = "LLMTimeoutError (status 408)"
+
     def get_provider_call_records_dropped(self) -> int:
         effective = self._effective_tracker()
         if effective is not self:

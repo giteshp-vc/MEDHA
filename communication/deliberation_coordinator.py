@@ -20,6 +20,7 @@ from config.settings import (
 from core.agent_factory import AgentFactory
 from models.deliberation_models import (
     DeliberationExchange,
+    DeliberationProviderAttempt,
     DeliberationReport,
     DeliberationResponsePayload,
     DeliberationResponseType,
@@ -29,9 +30,15 @@ from models.deliberation_models import (
     DeliberationTriggerType,
     SuppressedDeliberationTrigger,
 )
+from models.provider_call import ProviderCallRecord, ProviderUsageSource
 from models.schemas import MessageType, TaskStatus
 from models.task_models import TaskPlan, TaskResult
-from utils.retry import LLMBudgetExceededError, LLMTokenBudgetExceededError
+from utils.retry import (
+    LLMError,
+    LLMBudgetExceededError,
+    LLMTimeoutError,
+    LLMTokenBudgetExceededError,
+)
 from utils.token_tracker import TokenTracker
 
 
@@ -163,6 +170,8 @@ class DeliberationCoordinator:
                 )
                 return report
 
+            report.claims_considered = sum(len(result.claims) for result in self.task_results)
+
             triggers = self.policy.evaluate_triggers(
                 self.execution_id,
                 self.plan,
@@ -175,7 +184,11 @@ class DeliberationCoordinator:
 
             report.triggered = True
             report.triggers.extend(triggers)
-            self._processed_trigger_keys.update(self._trigger_key(trigger) for trigger in triggers)
+            self._processed_trigger_keys.update(
+                self._trigger_key_for_reference(trigger, claim_reference)
+                for trigger in triggers
+                for claim_reference in (self._claim_references(trigger) or [None])
+            )
             pending = list(triggers)
             for round_number in range(1, self.max_rounds + 1):
                 if not pending or self._termination_hint is not None:
@@ -209,6 +222,21 @@ class DeliberationCoordinator:
                 if message.metadata.get("deliberation_exchange")
             )
             report.total_tokens = self._tokens_used
+            report.trigger_count = len(report.triggers)
+            report.suppressed_trigger_count = len(report.suppressed_triggers)
+            report.coalesced_duplicate_trigger_count = sum(
+                len(trigger.related_claim_references) for trigger in report.triggers
+            )
+            report.exchange_count = len(report.exchanges)
+            report.completed_exchange_count = sum(
+                1 for exchange in report.exchanges if exchange.response_message_id is not None
+            )
+            report.challenge_count = sum(
+                1 for trigger in report.triggers
+                if trigger.trigger_type == DeliberationTriggerType.CONFLICTING_CLAIMS
+            )
+            report.completed_round_count = sum(1 for round_record in report.rounds if round_record.completed)
+            report.token_usage_source = self._token_source
             if self._token_source == "estimated":
                 report.diagnostics.append("Deliberation token usage used conservative local estimates.")
         return report
@@ -224,6 +252,7 @@ class DeliberationCoordinator:
             round_number=round_number,
         )
         report.rounds.append(round_record)
+        tokens_before_round = self._tokens_used
         messages_before = self._message_count()
         followups: List[DeliberationTrigger] = []
 
@@ -250,11 +279,20 @@ class DeliberationCoordinator:
                 round_record.termination_reason = DeliberationTerminationReason.MAX_EXCHANGES_REACHED
                 continue
 
-            exchange = await self._execute_exchange(trigger, report)
+            try:
+                exchange = await self._execute_exchange(trigger, report)
+            except asyncio.CancelledError:
+                round_record.termination_reason = DeliberationTerminationReason.TASK_CANCELLED
+                round_record.message_count = self._message_count() - messages_before
+                round_record.token_count = max(0, self._tokens_used - tokens_before_round)
+                round_record.cumulative_token_count = self._tokens_used
+                round_record.completed = False
+                raise
             round_record.exchange_ids.append(exchange.exchange_id)
             report.exchanges.append(exchange)
-            if trigger.claim_reference:
-                self._exchanges_by_claim[trigger.claim_reference] += 1
+            report.claims_considered += len(exchange.introduced_claims)
+            for claim_reference in self._claim_references(trigger):
+                self._exchanges_by_claim[claim_reference] += 1
             if (
                 trigger.trigger_type == DeliberationTriggerType.CRITICAL_UNRESOLVED_QUESTION
                 and trigger.related_claim_text
@@ -288,7 +326,11 @@ class DeliberationCoordinator:
                 self._termination_hint = DeliberationTerminationReason.MAX_ROUNDS_REACHED
 
         round_record.message_count = self._message_count() - messages_before
-        round_record.token_count = self._tokens_used
+        round_record.token_count = max(0, self._tokens_used - tokens_before_round)
+        round_record.cumulative_token_count = self._tokens_used
+        round_record.completed = self._termination_hint is None and round_record.termination_reason is None
+        if not round_record.completed and round_record.termination_reason is None:
+            round_record.termination_reason = self._termination_hint
         return followups
 
     async def _execute_exchange(
@@ -301,6 +343,8 @@ class DeliberationCoordinator:
             execution_id=self.execution_id,
             correlation_id=trigger.correlation_id,
             claim_reference=trigger.claim_reference,
+            related_claim_references=list(trigger.related_claim_references),
+            source_references=list(trigger.source_references),
             trigger_type=trigger.trigger_type,
             round_number=trigger.round_number,
             initiator_agent_id=trigger.source_agent_id,
@@ -356,7 +400,8 @@ class DeliberationCoordinator:
             content=self._request_content(trigger),
             correlation_id=trigger.correlation_id,
             reply_to_message_id=trigger.reply_to_message_id,
-            claim_references=[trigger.claim_reference] if trigger.claim_reference else [],
+            claim_references=self._claim_references(trigger),
+            evidence_references=list(trigger.source_references),
             metadata={
                 "deliberation_exchange": True,
                 "exchange_id": trigger.exchange_id,
@@ -370,7 +415,7 @@ class DeliberationCoordinator:
             exchange.request_message_id = request.message_id
             await self.shared_context.add_communication(request.model_dump(mode="json"))
         except Exception as error:
-            exchange.diagnostic = f"Request publication failed: {type(error).__name__}: {error}"
+            exchange.diagnostic = f"Request publication failed ({type(error).__name__})."
             report.diagnostics.append(exchange.diagnostic)
             if "message limit reached" in str(error).lower():
                 self._termination_hint = DeliberationTerminationReason.MESSAGE_BUDGET_EXHAUSTED
@@ -400,6 +445,13 @@ class DeliberationCoordinator:
             self._termination_hint = DeliberationTerminationReason.TOKEN_BUDGET_EXHAUSTED
             return exchange
 
+        exchange.estimated_input_tokens = input_estimate
+        exchange.reserved_output_tokens = max(0, output_limit)
+        exchange.reserved_total_tokens = input_estimate + max(0, output_limit)
+        provider_calls_before = {
+            record.call_id
+            for record in self.token_tracker.get_provider_call_records(self.execution_id)
+        }
         estimate_if_unreconciled = True
         try:
             with self.token_tracker.operation("deliberation"):
@@ -424,25 +476,64 @@ class DeliberationCoordinator:
         except asyncio.CancelledError:
             exchange.diagnostic = "Targeted response was cancelled."
             report.diagnostics.append(exchange.diagnostic)
+            report.exchanges.append(exchange)
+            if report.rounds:
+                report.rounds[-1].exchange_ids.append(exchange.exchange_id)
             raise
         except asyncio.TimeoutError as error:
-            exchange.diagnostic = f"Targeted response timed out: {error}"
+            timed_out_call_ids = {
+                record.call_id
+                for record in self.token_tracker.get_provider_call_records(self.execution_id)
+                if record.call_id not in provider_calls_before
+                and record.stage == "deliberation"
+                and record.agent_id == target_agent.agent_id
+                and _enum_value(record.status) == "CANCELLED"
+            }
+            self.token_tracker.mark_cancelled_provider_calls_timed_out(timed_out_call_ids)
+            exchange.diagnostic = "Targeted response timed out."
             report.diagnostics.append(exchange.diagnostic)
             self._termination_hint = DeliberationTerminationReason.TIMEOUT
             return exchange
-        except (LLMBudgetExceededError, LLMTokenBudgetExceededError) as error:
-            exchange.diagnostic = f"Deliberation token budget exhausted: {error}"
+        except LLMTimeoutError:
+            exchange.diagnostic = "Targeted provider response timed out."
             report.diagnostics.append(exchange.diagnostic)
-            self._termination_hint = DeliberationTerminationReason.TOKEN_BUDGET_EXHAUSTED
+            self._termination_hint = DeliberationTerminationReason.TIMEOUT
+            estimate_if_unreconciled = False
+            return exchange
+        except LLMTokenBudgetExceededError:
+            exchange.diagnostic = "Shared task token budget exhausted during deliberation."
+            report.diagnostics.append(exchange.diagnostic)
+            self._termination_hint = DeliberationTerminationReason.TASK_BUDGET_EXHAUSTED
+            estimate_if_unreconciled = False
+            return exchange
+        except LLMBudgetExceededError:
+            exchange.diagnostic = "Shared task call budget exhausted during deliberation."
+            report.diagnostics.append(exchange.diagnostic)
+            self._termination_hint = DeliberationTerminationReason.CALL_BUDGET_EXHAUSTED
+            estimate_if_unreconciled = False
+            return exchange
+        except LLMError as error:
+            exchange.diagnostic = f"Deliberation provider call failed ({type(error).__name__})."
+            report.diagnostics.append(exchange.diagnostic)
+            self._termination_hint = DeliberationTerminationReason.PROVIDER_FAILURE
             estimate_if_unreconciled = False
             return exchange
         except Exception as error:
-            exchange.diagnostic = f"Targeted response failed: {type(error).__name__}: {error}"
+            exchange.diagnostic = f"Targeted response failed ({type(error).__name__})."
             report.diagnostics.append(exchange.diagnostic)
             self._termination_hint = DeliberationTerminationReason.AGENT_FAILURE
+            estimate_if_unreconciled = False
             return exchange
         finally:
             after = await self.token_tracker.get_summary()
+            provider_calls_after = self.token_tracker.get_provider_call_records(self.execution_id)
+            attempt_records = [
+                record for record in provider_calls_after
+                if record.call_id not in provider_calls_before
+                and record.stage == "deliberation"
+                and record.agent_id == target_agent.agent_id
+            ]
+            self._capture_exchange_usage(exchange, before, after, attempt_records)
             self._reconcile_tokens(
                 before,
                 after,
@@ -509,7 +600,7 @@ class DeliberationCoordinator:
             self._agent_message_counts[target_agent.agent_id] += 1
             await self.shared_context.add_communication(response_message.model_dump(mode="json"))
         except Exception as error:
-            exchange.diagnostic = f"Response publication failed: {type(error).__name__}: {error}"
+            exchange.diagnostic = f"Response publication failed ({type(error).__name__})."
             report.diagnostics.append(exchange.diagnostic)
             if "message limit reached" in str(error).lower():
                 self._termination_hint = DeliberationTerminationReason.MESSAGE_BUDGET_EXHAUSTED
@@ -543,6 +634,60 @@ class DeliberationCoordinator:
                 f"{', '.join(exchange.evidence_references)}"
             )
         return exchange
+
+    @staticmethod
+    def _capture_exchange_usage(
+        exchange: DeliberationExchange,
+        before: Dict[str, object],
+        after: Dict[str, object],
+        records: Sequence[ProviderCallRecord],
+    ) -> None:
+        """Attach per-exchange accounting deltas without recomputing report totals."""
+        before_accounted = int(before.get("accounted_total_tokens", before.get("total_tokens", 0)) or 0)
+        after_accounted = int(after.get("accounted_total_tokens", after.get("total_tokens", 0)) or 0)
+        before_estimated = int(before.get("estimated_tokens_without_usage", 0) or 0)
+        after_estimated = int(after.get("estimated_tokens_without_usage", 0) or 0)
+        exchange.tracker_accounted_token_delta = max(0, after_accounted - before_accounted)
+        exchange.tracker_estimated_token_delta = max(0, after_estimated - before_estimated)
+        exchange.provider_attempts = [
+            DeliberationProviderAttempt(
+                call_id=record.call_id,
+                attempt_number=record.attempt_number,
+                retry_number=record.retry_number,
+                max_retry_attempts=record.max_retry_attempts,
+                status=record.status,
+                reserved_input_tokens=record.estimated_prompt_tokens,
+                reserved_output_tokens=record.output_token_limit,
+                reserved_total_tokens=(
+                    record.estimated_prompt_tokens + record.output_token_limit
+                    if record.estimated_prompt_tokens is not None and record.output_token_limit is not None
+                    else None
+                ),
+                provider_prompt_tokens=record.prompt_tokens,
+                provider_candidate_tokens=record.candidate_tokens,
+                provider_total_tokens=record.total_tokens,
+                usage_source=record.usage_source,
+                error_category=record.error_category,
+                http_status_code=record.http_status_code,
+                provider_error_code=record.provider_error_code,
+                retry_classification=record.retry_classification,
+            )
+            for record in records
+        ]
+
+        def known_sum(attribute: str) -> Optional[int]:
+            values = [getattr(record, attribute) for record in records]
+            known = [value for value in values if isinstance(value, int) and not isinstance(value, bool)]
+            return sum(known) if known else None
+
+        exchange.provider_prompt_tokens = known_sum("prompt_tokens")
+        exchange.provider_candidate_tokens = known_sum("candidate_tokens")
+        exchange.provider_total_tokens = known_sum("total_tokens")
+        sources = {record.usage_source for record in records}
+        if sources:
+            exchange.provider_usage_source = (
+                ProviderUsageSource.MIXED if len(sources) > 1 else next(iter(sources))
+            )
 
     def _reevaluate_response(
         self,
@@ -612,8 +757,12 @@ class DeliberationCoordinator:
                     )
                 )
                 continue
-            key = self._trigger_key(candidate)
-            self._processed_trigger_keys.add(key)
+            for claim_reference in self._claim_references(candidate):
+                self._processed_trigger_keys.add(
+                    self._trigger_key_for_reference(candidate, claim_reference)
+                )
+            if not self._claim_references(candidate):
+                self._processed_trigger_keys.add(self._trigger_key_for_reference(candidate, None))
             report.triggers.append(candidate)
             accepted.append(candidate)
         return accepted
@@ -686,8 +835,10 @@ class DeliberationCoordinator:
         trigger: DeliberationTrigger,
         round_number: int,
     ) -> Optional[str]:
-        key = self._trigger_key(trigger)
-        if key in self._processed_trigger_keys:
+        if any(
+            self._trigger_key_for_reference(trigger, claim_reference) in self._processed_trigger_keys
+            for claim_reference in (self._claim_references(trigger) or [None])
+        ):
             return "Duplicate trigger for the same type, claim, source, and target was already processed."
         correlation = (
             trigger.correlation_id,
@@ -717,15 +868,29 @@ class DeliberationCoordinator:
             or self._agent_message_counts[trigger.target_agent_id] + 1 > self.max_messages_per_agent
         ):
             return "Per-agent deliberation message budget is exhausted."
-        if trigger.claim_reference and self._exchanges_by_claim[trigger.claim_reference] >= self.max_exchanges_per_claim:
+        if any(
+            self._exchanges_by_claim[claim_reference] >= self.max_exchanges_per_claim
+            for claim_reference in self._claim_references(trigger)
+        ):
             return "Maximum exchanges for this claim were reached."
         return None
 
     @staticmethod
-    def _trigger_key(trigger: DeliberationTrigger) -> tuple[str, Optional[str], str, str]:
+    def _claim_references(trigger: DeliberationTrigger) -> List[str]:
+        return list(dict.fromkeys(
+            reference
+            for reference in [trigger.claim_reference, *trigger.related_claim_references]
+            if reference
+        ))
+
+    @staticmethod
+    def _trigger_key_for_reference(
+        trigger: DeliberationTrigger,
+        claim_reference: Optional[str],
+    ) -> tuple[str, Optional[str], str, str]:
         return (
             _enum_value(trigger.trigger_type),
-            trigger.claim_reference,
+            claim_reference,
             trigger.source_agent_id,
             trigger.target_agent_id,
         )
@@ -733,7 +898,7 @@ class DeliberationCoordinator:
     @staticmethod
     def _request_content(trigger: DeliberationTrigger) -> str:
         return (
-            f"{_enum_value(trigger.trigger_type)}: {trigger.reason} "
+            f"{trigger.reason} "
             f"Claim or finding: {trigger.related_claim_text or 'See the relevant execution context.'}"
         )
 
@@ -748,6 +913,7 @@ class DeliberationCoordinator:
             None,
         )
         evidence = []
+        evidence.extend(trigger.source_references)
         for result in (source_result, relevant_result):
             if result is None:
                 continue
@@ -765,6 +931,7 @@ class DeliberationCoordinator:
             f"Requesting agent ID (use as recipient_agent_id): {trigger.source_agent_id}\n"
             f"Trigger: {_enum_value(trigger.trigger_type)}\n"
             f"Claim reference: {trigger.claim_reference or 'none'}\n"
+            f"Related exact claim references: {', '.join(trigger.related_claim_references) or 'none'}\n"
             f"Evidence references: {', '.join(evidence) or 'none'}\n"
             f"Request: {self._request_content(trigger)}\n"
             f"Target specialist context:\n{context}\n\n"

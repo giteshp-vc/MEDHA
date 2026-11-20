@@ -1294,7 +1294,12 @@ async def test_coordinator_cancellation_stops_before_claim_extraction(monkeypatc
     [
         DeliberationTerminationReason.AGENT_FAILURE,
         DeliberationTerminationReason.TOKEN_BUDGET_EXHAUSTED,
+        DeliberationTerminationReason.TASK_BUDGET_EXHAUSTED,
+        DeliberationTerminationReason.CALL_BUDGET_EXHAUSTED,
+        DeliberationTerminationReason.PROVIDER_FAILURE,
         DeliberationTerminationReason.TIMEOUT,
+        DeliberationTerminationReason.MAX_ROUNDS_REACHED,
+        DeliberationTerminationReason.MAX_EXCHANGES_REACHED,
     ],
 )
 @pytest.mark.asyncio
