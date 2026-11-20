@@ -10,6 +10,11 @@ groq
 # Data validation and structured models
 pydantic
 
+# Local document parsing and CPU embeddings for hybrid retrieval
+PyMuPDF
+python-docx
+fastembed
+
 # Async HTTP requests
 httpx
 

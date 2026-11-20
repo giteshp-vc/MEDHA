@@ -98,6 +98,25 @@ class SpecialistAgent(BaseAgent):
             if shared_notes:
                 context_str += f"\n\n### Shared Task Context:\n{shared_notes}\n"
 
+            retrieved_evidence = context.get("retrieved_evidence", [])
+            if retrieved_evidence:
+                context_str += "\n\n### Retrieved Source Excerpts (cite exact chunk IDs):\n"
+                for item in retrieved_evidence:
+                    location = item.get("evidence_location") or "location unavailable"
+                    context_str += (
+                        f"- [Evidence ID: {item.get('chunk_id')}; Source: {item.get('source_name')}; "
+                        f"Location: {location}; Reference: {item.get('source_reference')}]\n"
+                        f"  Excerpt: {item.get('supporting_content', '')}\n"
+                    )
+            elif context.get("retrieval_attempted"):
+                context_str += (
+                    "\n\n### Retrieved Source Excerpts\n"
+                    "No relevant registered source excerpts were found for this subtask. "
+                    "Do not invent citations; state uncertainty where source support is needed.\n"
+                )
+            if context and context.get("retrieval_error"):
+                context_str += "\nSource retrieval was unavailable for this subtask; do not imply source verification.\n"
+
         prompt = (
             f"Execute your assigned task:\n"
             f"Role: {self.role}\n"
@@ -107,7 +126,8 @@ class SpecialistAgent(BaseAgent):
             f"- 'deliverable': comprehensive technical explanation and recommendations\n"
             f"- 'findings': list of key analytical conclusions\n"
             f"- 'claims': list of specific factual, architectural, or performance claims requiring verification\n"
-            f"- 'evidence_references': list of supporting reasons, benchmarks, or domain rationales for the claims\n"
+            f"- 'evidence_references': list of exact Evidence IDs from the retrieved excerpts that support your claims; "
+            f"do not invent IDs, URLs, or references\n"
             f"- 'assumptions': list of explicitly acknowledged assumptions\n"
             f"- 'unresolved_questions': list of open questions or unresolved risks"
         )

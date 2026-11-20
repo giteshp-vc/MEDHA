@@ -1,9 +1,10 @@
 
 import json
+from collections import OrderedDict
 from typing import Any, Callable, Dict, Optional
 
 from benchmark.baseline import SingleAgentBaseline
-from config.settings import LOGS_DIR
+from config.settings import LOGS_DIR, MCP_MAX_RECORDS, MEDHA_DOCUMENTS_DIR, MEDHA_STORAGE_MODE
 from core.orchestrator import MedhaOrchestrator, MedhaResult
 from mcp_server.registry import ExecutionRegistry, execution_registry
 from utils.logger import get_logger
@@ -11,7 +12,7 @@ from utils.logger import get_logger
 logger = get_logger("mcp_tools")
 
 # Cache of completed in-memory executions.
-_execution_cache: Dict[str, MedhaResult] = {}
+_execution_cache: Dict[str, MedhaResult] = OrderedDict()
 
 
 def _validate_execution_options(task: str, max_concurrency: int, max_repair_iterations: int) -> Optional[str]:
@@ -26,7 +27,11 @@ def _validate_execution_options(task: str, max_concurrency: int, max_repair_iter
 
 def cache_execution_result(result: MedhaResult) -> None:
     """Store execution result in memory for legacy query tools."""
-    _execution_cache[result.execution_id] = result
+    if result.storage_mode == "persistent":
+        _execution_cache[result.execution_id] = result
+        _execution_cache.move_to_end(result.execution_id)
+        while len(_execution_cache) > MCP_MAX_RECORDS:
+            _execution_cache.popitem(last=False)
 
 
 def get_cached_or_logged_execution(
@@ -35,6 +40,9 @@ def get_cached_or_logged_execution(
     """Retrieve an execution record from cache or execution logs."""
     if execution_id in _execution_cache:
         return _execution_cache[execution_id].model_dump(mode="json")
+
+    if MEDHA_STORAGE_MODE != "persistent":
+        return None
 
     log_path = LOGS_DIR / f"execution_{execution_id}.json"
 
@@ -53,6 +61,8 @@ async def run_medha_task_impl(
     max_concurrency: int = 4,
     max_repair_iterations: int = 2,
     orchestrator: Optional[MedhaOrchestrator] = None,
+    documents: Optional[list[str]] = None,
+    source_urls: Optional[list[str]] = None,
 ) -> Dict[str, Any]:
     """Execute a task synchronously through MEDHA."""
     validation_error = _validate_execution_options(task, max_concurrency, max_repair_iterations)
@@ -62,9 +72,16 @@ async def run_medha_task_impl(
     orch = orchestrator or MedhaOrchestrator(
         max_concurrency=max_concurrency,
         max_repair_iterations=max_repair_iterations,
+        storage_mode=MEDHA_STORAGE_MODE,
     )
 
-    result = await orch.run_task(task)
+    result = await orch.run_task(
+        task,
+        documents=documents,
+        source_urls=source_urls,
+        storage_mode=MEDHA_STORAGE_MODE,
+        allowed_document_root=str(MEDHA_DOCUMENTS_DIR),
+    )
     cache_execution_result(result)
 
     rep = result.verification_report
@@ -75,6 +92,9 @@ async def run_medha_task_impl(
         "final_answer": result.final_answer,
         "status": result.status,
         "duration_seconds": result.duration_seconds,
+        "storage_mode": result.storage_mode,
+        "cleanup_verified": result.cleanup_verified,
+        "cleanup_error": result.cleanup_error,
         "verification_status": {
             "total_claims": rep.get("total_claims", 0),
             "accepted_claims_count": len(rep.get("accepted_claims", [])),
@@ -82,6 +102,8 @@ async def run_medha_task_impl(
             "support_rate": rep.get("support_rate"),
             "repair_success_rate": rep.get("repair_success_rate", 0.0),
         },
+        "verification_report": rep,
+        "retrieval_diagnostics": result.retrieval_diagnostics,
         "token_usage": result.token_usage,
         "unresolved_questions": result.unresolved_questions,
     }
@@ -93,6 +115,8 @@ async def start_medha_task_impl(
     max_repair_iterations: int = 2,
     registry: Optional[ExecutionRegistry] = None,
     orchestrator_factory: Optional[Callable[[], MedhaOrchestrator]] = None,
+    documents: Optional[list[str]] = None,
+    source_urls: Optional[list[str]] = None,
 ) -> Dict[str, Any]:
     """Submit a MEDHA task for background execution."""
     validation_error = _validate_execution_options(task, max_concurrency, max_repair_iterations)
@@ -111,10 +135,17 @@ async def start_medha_task_impl(
             else MedhaOrchestrator(
                 max_concurrency=max_concurrency,
                 max_repair_iterations=max_repair_iterations,
+                storage_mode=MEDHA_STORAGE_MODE,
             )
         )
 
-        result = await orch.run_task(task)
+        result = await orch.run_task(
+            task,
+            documents=documents,
+            source_urls=source_urls,
+            storage_mode=MEDHA_STORAGE_MODE,
+            allowed_document_root=str(MEDHA_DOCUMENTS_DIR),
+        )
         cache_execution_result(result)
         return result
 
@@ -222,11 +253,13 @@ async def get_execution_result_impl(
             "error": job["error"] or "No execution result is available.",
         }
 
-    return {
+    response = {
         "job_id": job_id,
         "status": job["status"],
         "result": job["result"],
     }
+    await job_registry.consume_result(job_id)
+    return response
 
 
 async def get_verification_report_impl(
@@ -277,6 +310,7 @@ async def get_verification_report_impl(
         "all_claims": data.get("claims", []),
         "evidence": data.get("evidence", []),
         "review_decisions": data.get("review_decisions", []),
+        "deterministic_checks": report.get("deterministic_checks", []),
         "repair_history": report.get(
             "repair_history",
             data.get("repair_history", []),

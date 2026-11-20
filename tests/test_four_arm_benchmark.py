@@ -1250,6 +1250,21 @@ async def test_experiment_rejects_invalid_limits_and_unsafe_ids(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_four_arm_rejects_implicit_persistent_export_in_ephemeral_mode(tmp_path, monkeypatch):
+    from config import settings
+
+    monkeypatch.setattr(settings, "MEDHA_STORAGE_MODE", "ephemeral")
+    evaluator = BenchmarkEvaluator(
+        dataset_path=tmp_path / "missing.json",
+        baseline_runner=FakeBaseline(),
+        medha_runner=FakeMedhaRunner(),
+    )
+
+    with pytest.raises(PermissionError, match="Persistent Mode"):
+        await evaluator.run_experiment(experiment_id="implicit-export")
+
+
+@pytest.mark.asyncio
 async def test_multiple_blocks_and_repetitions_rotate_full_balanced_cycle(tmp_path):
     dataset_path = tmp_path / "cases.json"
     dataset_path.write_text(json.dumps([

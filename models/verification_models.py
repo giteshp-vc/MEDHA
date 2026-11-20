@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 from pydantic import Field
 
 from models.schemas import BaseSchema, ClaimKind, ClaimStatus, EvidenceSourceType, VerificationDecision
@@ -152,7 +152,20 @@ class ReviewFeedback(BaseSchema):
     has_contradictions: bool = Field(default=False)
     assumptions_presented_as_facts: bool = Field(default=False)
     logically_valid: bool = Field(default=False)
+    llm_decision: Optional[VerificationDecision] = None
+    deterministic_check_ids: List[str] = Field(default_factory=list)
     timestamp: str = Field(default_factory=utcnow_iso)
+
+
+class DeterministicCheckResult(BaseSchema):
+    """Rule-based check recorded separately from an LLM review verdict."""
+
+    check_id: str = Field(default_factory=lambda: generate_id("check"))
+    claim_id: str
+    checker: str
+    outcome: Literal["PASS", "FLAG", "NOT_APPLICABLE"]
+    findings: List[str] = Field(default_factory=list)
+    checked_at: str = Field(default_factory=utcnow_iso)
 
 
 class RepairAttempt(BaseSchema):
@@ -182,6 +195,7 @@ class VerificationReport(BaseSchema):
     unverifiable_claims: List[Claim] = Field(default_factory=list)
     unreviewed_claims: List[Claim] = Field(default_factory=list)  # Claims never audited due to interruption
     review_decisions: List[ReviewFeedback] = Field(default_factory=list)
+    deterministic_checks: List[DeterministicCheckResult] = Field(default_factory=list)
     repair_history: List[RepairAttempt] = Field(default_factory=list)
     support_rate: Optional[float] = None  # Percentage over reviewed claims; None when no claims were reviewed
     unsupported_rate: Optional[float] = None  # Percentage over reviewed claims; None when no claims were reviewed

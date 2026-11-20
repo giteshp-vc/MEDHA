@@ -38,6 +38,7 @@ class TaskResult(BaseSchema):
     findings: List[str] = Field(default_factory=list)
     claims: List[str] = Field(default_factory=list)
     evidence_items: List[Dict[str, Any]] = Field(default_factory=list)
+    retrieval_diagnostics: List[str] = Field(default_factory=list)
     assumptions: List[str] = Field(default_factory=list)
     unresolved_questions: List[str] = Field(default_factory=list)
     duration_seconds: float = 0.0

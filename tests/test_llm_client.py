@@ -70,13 +70,17 @@ def test_request_too_large_is_not_retried():
 
 @pytest.mark.parametrize(
     "tpm, input_tokens, requested, expected",
-    [(0, 5000, 4096, 4096), (8000, 4000, 4096, 3200), (8000, 1000, 2048, 2048), (8000, 7900, 4096, 256), (8000, 7900, 48, 48)],
+    [(0, 5000, 4096, 4096), (8000, 4000, 4096, 3200), (8000, 1000, 2048, 2048), (8000, 6000, 4096, 1200), (8000, 7900, 48, "raise")],
 )
 def test_groq_output_limit_fits_provider_tpm(monkeypatch, tpm, input_tokens, requested, expected):
     import core.providers.groq_client as groq_module
 
     monkeypatch.setattr(groq_module, "PROVIDER_TOKENS_PER_MINUTE", tpm)
-    assert GroqClient._fit_output_limit(input_tokens, requested) == expected
+    if expected == "raise":
+        with pytest.raises(LLMTokenBudgetExceededError, match="no output headroom"):
+            GroqClient._fit_output_limit(input_tokens, requested)
+    else:
+        assert GroqClient._fit_output_limit(input_tokens, requested) == expected
 
 
 @pytest.mark.asyncio

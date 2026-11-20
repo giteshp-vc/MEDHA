@@ -92,7 +92,14 @@ class GroqClient(BaseLLMClient):
             return output_limit
         # Local estimates can undercount the provider tokenizer; keep a 10% safety margin.
         headroom = int(PROVIDER_TOKENS_PER_MINUTE * 0.9) - estimated_input_tokens
-        return min(output_limit, max(256, headroom))
+        if headroom < 1:
+            from utils.retry import LLMTokenBudgetExceededError
+
+            raise LLMTokenBudgetExceededError(
+                "Estimated prompt leaves no output headroom under PROVIDER_TOKENS_PER_MINUTE; "
+                "reduce retrieved context or increase the configured provider cap."
+            )
+        return min(output_limit, headroom)
 
     @staticmethod
     def _is_unsupported_format_error(err: Exception) -> bool:

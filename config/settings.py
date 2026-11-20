@@ -1,5 +1,6 @@
 import os
 import math
+import tempfile
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -61,6 +62,7 @@ VERIFICATION_MODE = os.getenv("VERIFICATION_MODE", "strict").strip().lower()
 # MCP background execution
 MCP_MAX_ACTIVE_JOBS = int(os.getenv("MCP_MAX_ACTIVE_JOBS", "20"))
 MCP_MAX_RECORDS = int(os.getenv("MCP_MAX_RECORDS", "100"))
+MEDHA_MCP_RESULT_TTL = int(os.getenv("MEDHA_MCP_RESULT_TTL", "300"))
 
 # Phase 1 policy-controlled deliberation limits
 MAX_DELIBERATION_ROUNDS = int(os.getenv("MAX_DELIBERATION_ROUNDS", "2"))
@@ -76,6 +78,55 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 LOGS_DIR = BASE_DIR / "logs"
 BENCHMARK_DIR = BASE_DIR / "benchmark"
 
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean value.")
+
+
+# Ephemeral mode is the default. Persistent execution artifacts require an explicit mode choice.
+MEDHA_STORAGE_MODE = os.getenv("MEDHA_STORAGE_MODE", "ephemeral").strip().lower()
+MEDHA_AUTO_CLEANUP = _env_bool("MEDHA_AUTO_CLEANUP", True)
+MEDHA_CLEANUP_ON_FAILURE = _env_bool("MEDHA_CLEANUP_ON_FAILURE", True)
+MEDHA_WORKSPACE_TTL = int(os.getenv("MEDHA_WORKSPACE_TTL", "3600"))
+MEDHA_PERSISTENT_RETENTION_DAYS = int(os.getenv("MEDHA_PERSISTENT_RETENTION_DAYS", "30"))
+def _configured_path(name: str, default: Path) -> Path:
+    raw = os.getenv(name, "").strip()
+    selected = Path(raw).expanduser() if raw else default
+    if not selected.is_absolute():
+        selected = BASE_DIR / selected
+    return selected.resolve()
+
+
+MEDHA_EPHEMERAL_ROOT = _configured_path(
+    "MEDHA_EPHEMERAL_ROOT", Path(tempfile.gettempdir()) / "medha" / "executions"
+)
+MEDHA_PERSISTENT_ROOT = _configured_path("MEDHA_PERSISTENT_ROOT", BASE_DIR / "data" / "executions")
+MEDHA_DOCUMENTS_DIR = _configured_path("MEDHA_DOCUMENTS_DIR", BASE_DIR / "documents")
+
+# Retrieval is activated only when a caller supplies documents or approved URLs.
+MEDHA_RETRIEVAL_ENABLED = _env_bool("MEDHA_RETRIEVAL_ENABLED", True)
+MEDHA_HYBRID_SEARCH = _env_bool("MEDHA_HYBRID_SEARCH", True)
+MEDHA_EMBEDDING_PROVIDER = os.getenv("MEDHA_EMBEDDING_PROVIDER", "fastembed").strip().lower()
+MEDHA_EMBEDDING_MODEL = os.getenv("MEDHA_EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5").strip()
+MEDHA_MAX_RETRIEVED_CHUNKS = int(os.getenv("MEDHA_MAX_RETRIEVED_CHUNKS", "5"))
+MEDHA_CHUNK_SIZE_CHARS = int(os.getenv("MEDHA_CHUNK_SIZE_CHARS", "1400"))
+MEDHA_CHUNK_OVERLAP_CHARS = int(os.getenv("MEDHA_CHUNK_OVERLAP_CHARS", "180"))
+MEDHA_MAX_DOCUMENT_BYTES = int(os.getenv("MEDHA_MAX_DOCUMENT_BYTES", str(25 * 1024 * 1024)))
+MEDHA_MAX_SOURCE_RESPONSE_BYTES = int(os.getenv("MEDHA_MAX_SOURCE_RESPONSE_BYTES", str(10 * 1024 * 1024)))
+MEDHA_ALLOWED_SOURCE_DOMAINS = tuple(
+    domain.strip().lower()
+    for domain in os.getenv("MEDHA_ALLOWED_SOURCE_DOMAINS", "").split(",")
+    if domain.strip()
+)
+
 # Ensure directories exist
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -84,6 +135,23 @@ def validate_settings() -> bool:
     """Validate essential MEDHA configuration based on the active provider."""
     if VERIFICATION_MODE not in ("strict", "general"):
         raise ValueError("VERIFICATION_MODE must be 'strict' or 'general'.")
+
+    if MEDHA_STORAGE_MODE not in ("ephemeral", "persistent"):
+        raise ValueError("MEDHA_STORAGE_MODE must be 'ephemeral' or 'persistent'.")
+    if MEDHA_STORAGE_MODE == "ephemeral" and (not MEDHA_AUTO_CLEANUP or not MEDHA_CLEANUP_ON_FAILURE):
+        raise ValueError("Ephemeral mode requires automatic cleanup on success and failure.")
+    if MEDHA_WORKSPACE_TTL < 1 or MEDHA_PERSISTENT_RETENTION_DAYS < 1:
+        raise ValueError("Workspace TTL and persistent retention must be positive.")
+    if MEDHA_RETRIEVAL_ENABLED and MEDHA_EMBEDDING_PROVIDER not in ("fastembed", "none"):
+        raise ValueError("MEDHA_EMBEDDING_PROVIDER must be 'fastembed' or 'none'.")
+    if MEDHA_RETRIEVAL_ENABLED and MEDHA_HYBRID_SEARCH and MEDHA_EMBEDDING_PROVIDER == "none":
+        raise ValueError("Hybrid retrieval requires a local embedding provider.")
+    if MEDHA_MAX_RETRIEVED_CHUNKS < 1:
+        raise ValueError("MEDHA_MAX_RETRIEVED_CHUNKS must be at least 1.")
+    if MEDHA_CHUNK_SIZE_CHARS < 100 or not 0 <= MEDHA_CHUNK_OVERLAP_CHARS < MEDHA_CHUNK_SIZE_CHARS:
+        raise ValueError("Chunk size must be >= 100 and overlap must be non-negative and smaller than chunk size.")
+    if MEDHA_MAX_DOCUMENT_BYTES < 1 or MEDHA_MAX_SOURCE_RESPONSE_BYTES < 1:
+        raise ValueError("Document and source response byte limits must be positive.")
 
     provider = (LLM_PROVIDER or "").lower().strip()
     if provider not in ("groq", "gemini"):
@@ -160,6 +228,8 @@ def validate_settings() -> bool:
         raise ValueError("MCP_MAX_ACTIVE_JOBS must be at least 1.")
     if MCP_MAX_RECORDS < 1:
         raise ValueError("MCP_MAX_RECORDS must be at least 1.")
+    if MEDHA_MCP_RESULT_TTL < 1:
+        raise ValueError("MEDHA_MCP_RESULT_TTL must be at least 1 second.")
     if MAX_DELIBERATION_ROUNDS < 1:
         raise ValueError("MAX_DELIBERATION_ROUNDS must be at least 1.")
     if MAX_EXCHANGES_PER_CLAIM < 1:

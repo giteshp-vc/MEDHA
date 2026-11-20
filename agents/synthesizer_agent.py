@@ -89,6 +89,12 @@ class SynthesizerAgent(BaseAgent):
             for c in verification_report.unreviewed_claims
         ) or "None unreviewed."
 
+        deterministic_checks_text = "\n".join(
+            f"- [{check.outcome}] {check.checker} for claim {check.claim_id}: "
+            f"{'; '.join(check.findings) or 'No deterministic issue found.'}"
+            for check in verification_report.deterministic_checks
+        ) or "None recorded."
+
         # Format repairs
         repairs_text = "\n".join(
             f"- [Repaired Claim {r.claim_id}]: Original '{r.original_claim_text}' -> Revised: '{r.revised_claim_text}'"
@@ -155,6 +161,7 @@ class SynthesizerAgent(BaseAgent):
             f"- Needs Revision Claims ({len(verification_report.needs_revision_claims)}):\n{needs_rev_text}\n\n"
             f"- Unverifiable Claims ({len(verification_report.unverifiable_claims)}):\n{unverifiable_text}\n\n"
             f"- Unreviewed Claims ({len(verification_report.unreviewed_claims)}):\n{unreviewed_text}\n\n"
+            f"- Deterministic Checks (separate from LLM verdicts):\n{deterministic_checks_text}\n\n"
             f"- Repaired Claims ({len(verification_report.repair_history)}):\n{repairs_text}\n\n"
         )
 
@@ -322,6 +329,13 @@ class SynthesizerAgent(BaseAgent):
             + f"- Rejected: {claim_list(verification_report.rejected_claims)}\n"
             + f"- Unverifiable: {claim_list(verification_report.unverifiable_claims)}\n"
             + f"- Unreviewed: {claim_list(verification_report.unreviewed_claims)}\n"
+            + "- Deterministic checks (separate from the LLM reviewer):\n"
+            + ("\n".join(
+                f"  - [{check.outcome}] {check.checker} for {check.claim_id}: "
+                f"{'; '.join(check.findings) or 'No issue found.'}"
+                for check in verification_report.deterministic_checks
+            ) or "  - None.")
+            + "\n"
             + f"- Needs revision: {claim_list(verification_report.needs_revision_claims)}\n\n"
             "### Deliberation Transcript (Unverified Context; Not Evidence)\n"
             + deliberation_text

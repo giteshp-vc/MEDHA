@@ -24,6 +24,7 @@ def _create_sample_medha_result(exec_id: str = "exec_test_mcp") -> MedhaResult:
         task="Test task for MCP",
         final_answer="Final synthesized response for MCP",
         status="COMPLETED",
+        storage_mode="persistent",
         duration_seconds=5.2,
         token_usage={"total_tokens": 500},
         generated_agents=[{"agent_id": "a1", "role": "Architect", "status": "COMPLETED"}],
@@ -57,6 +58,28 @@ async def test_run_medha_task_impl():
     assert summary["status"] == "COMPLETED"
     assert summary["final_answer"] == "Final synthesized response for MCP"
     assert summary["verification_status"]["support_rate"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_ephemeral_foreground_result_is_not_cached_or_written(monkeypatch, tmp_path):
+    monkeypatch.setattr("mcp_server.tools.MEDHA_STORAGE_MODE", "ephemeral")
+    monkeypatch.setattr("mcp_server.tools.LOGS_DIR", tmp_path)
+    mock_orchestrator = MagicMock()
+    result = _create_sample_medha_result("exec_ephemeral_foreground")
+    result.storage_mode = "ephemeral"
+    mock_orchestrator.run_task = AsyncMock(return_value=result)
+
+    response = await run_medha_task_impl(
+        "Synthetic private MCP task",
+        orchestrator=mock_orchestrator,
+    )
+
+    assert response["status"] == "COMPLETED"
+    assert response["storage_mode"] == "ephemeral"
+    assert await get_execution_status_impl("exec_ephemeral_foreground") == {
+        "error": "Execution ID 'exec_ephemeral_foreground' not found."
+    }
+    assert list(tmp_path.iterdir()) == []
 
 
 @pytest.mark.asyncio

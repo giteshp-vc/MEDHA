@@ -9,8 +9,11 @@ from typing import Any, List, Optional
 
 from benchmark.baseline import SingleAgentBaseline
 from benchmark.evaluator import BenchmarkEvaluator
+from config import settings
 from config.settings import BENCHMARK_DIR, LLM_PROVIDER, validate_settings
 from core.orchestrator import MedhaOrchestrator
+from storage.workspace import cleanup_stale_workspaces
+from utils.privacy import storage_mode_context
 from utils.logger import get_logger
 
 logger = get_logger("main")
@@ -74,7 +77,7 @@ def _format_rate(val: Any) -> str:
         return "N/A"
 
 
-async def run_interactive_session(full_report: bool = False):
+async def run_interactive_session(full_report: bool = False, persistent: bool = False):
     """Run interactive terminal session for MEDHA."""
     print(BANNER)
     try:
@@ -84,7 +87,8 @@ async def run_interactive_session(full_report: bool = False):
         print(f"[ERROR] Configuration error: {e}")
         sys.exit(1)
 
-    orchestrator = MedhaOrchestrator()
+    storage_mode = "persistent" if persistent else settings.MEDHA_STORAGE_MODE
+    orchestrator = MedhaOrchestrator(storage_mode=storage_mode)
 
     while True:
         try:
@@ -157,18 +161,35 @@ async def run_interactive_session(full_report: bool = False):
             print(f"\n[ERROR] An error occurred: {e}")
 
 
-async def run_single_task(task_text: str, full_report: bool = False):
+async def run_single_task(
+    task_text: str,
+    full_report: bool = False,
+    documents: Optional[List[str]] = None,
+    source_urls: Optional[List[str]] = None,
+    persistent: bool = False,
+):
     """Run a single task passed via command line."""
     validate_settings()
-    orchestrator = MedhaOrchestrator()
-    print(f"Executing MEDHA for task: '{task_text}'\n")
-    result = await orchestrator.run_task(task_text)
+    storage_mode = "persistent" if persistent else settings.MEDHA_STORAGE_MODE
+    orchestrator = MedhaOrchestrator(storage_mode=storage_mode)
+    print("Executing MEDHA task...\n")
+    result = await orchestrator.run_task(
+        task_text,
+        documents=documents,
+        source_urls=source_urls,
+        storage_mode=storage_mode,
+    )
     print(_answer_for_console(result.final_answer, full_report))
     print("\n--- Summary ---")
     print(f"Execution ID: {result.execution_id} | Duration: {result.duration_seconds}s | Status: {result.status}")
     print(f"Support Rate: {_format_rate(result.verification_report.get('support_rate', 0.0))}")
-    if not full_report:
+    if not full_report and result.storage_mode == "persistent":
         print(f"Full report: logs/execution_{result.execution_id}.json (or rerun with --full)")
+    elif not full_report:
+        if result.cleanup_verified:
+            print("Ephemeral Mode: workspace cleanup verified after result delivery.")
+        else:
+            print(f"Ephemeral Mode cleanup was not verified: {result.cleanup_error or 'unknown cleanup error'}")
 
 
 async def run_benchmark_cli(
@@ -176,6 +197,7 @@ async def run_benchmark_cli(
     repetitions: int = 1,
     experiment_id: Optional[str] = None,
     output_directory: Optional[Path] = None,
+    persistent_authorized: bool = False,
 ):
     """Run the explicit four-arm benchmark experiment."""
     validate_settings()
@@ -184,14 +206,18 @@ async def run_benchmark_cli(
     if settings.VERIFICATION_MODE != "strict":
         print("Benchmark requires VERIFICATION_MODE=strict; set it in .env and rerun.")
         sys.exit(2)
+    if not persistent_authorized:
+        print("Benchmark exports require explicit persistence authorization; rerun with --persistent.")
+        sys.exit(2)
     print("\nStarting MEDHA four-arm benchmark experiment...")
     evaluator = BenchmarkEvaluator()
-    result = await evaluator.run_experiment(
-        max_cases=max_cases,
-        repetitions=repetitions,
-        experiment_id=experiment_id,
-        output_directory=output_directory,
-    )
+    with storage_mode_context("persistent"):
+        result = await evaluator.run_experiment(
+            max_cases=max_cases,
+            repetitions=repetitions,
+            experiment_id=experiment_id,
+            output_directory=output_directory,
+        )
     print(json.dumps({
         "experiment_id": result.experiment.experiment_id,
         "aggregate_results": result.aggregate_results,
@@ -241,6 +267,13 @@ def main():
         action="store_true",
         help="Print the full verification report instead of only the direct answer",
     )
+    parser.add_argument(
+        "--persistent",
+        action="store_true",
+        help="Explicitly retain execution records (required for benchmark exports)",
+    )
+    parser.add_argument("--document", action="append", dest="documents", help="Local PDF/DOCX/text source; may be repeated")
+    parser.add_argument("--source-url", action="append", dest="source_urls", help="Approved HTTPS source URL; may be repeated")
 
     args = parser.parse_args()
 
@@ -266,6 +299,15 @@ def main():
             parser.error("--benchmark-output must remain inside the benchmark output directory")
     if not args.benchmark and any((args.benchmark_cases is not None, args.experiment_id, args.benchmark_output is not None, args.benchmark_repetitions != 1)):
         parser.error("benchmark options require --benchmark")
+    if (args.documents or args.source_urls) and not args.task:
+        parser.error("--document and --source-url require --task")
+    if args.mcp and args.persistent:
+        parser.error("For MCP Persistent Mode, set MEDHA_STORAGE_MODE=persistent before starting the server.")
+
+    startup_mode = "persistent" if args.persistent else settings.MEDHA_STORAGE_MODE
+    cleanup_report = cleanup_stale_workspaces(startup_mode)
+    if cleanup_report["failed"]:
+        logger.warning("Startup cleanup could not remove %d expired execution workspace(s).", cleanup_report["failed"])
 
     if args.mcp:
         from mcp_server.server import main as mcp_main
@@ -276,16 +318,23 @@ def main():
             repetitions=args.benchmark_repetitions,
             experiment_id=args.experiment_id,
             output_directory=args.benchmark_output,
+            persistent_authorized=args.persistent,
         ))
     elif args.baseline:
         validate_settings()
-        baseline = SingleAgentBaseline()
+        baseline = SingleAgentBaseline(storage_mode="persistent" if args.persistent else settings.MEDHA_STORAGE_MODE)
         res = asyncio.run(baseline.run(args.baseline))
         print(_console_text(res.answer))
     elif args.task:
-        asyncio.run(run_single_task(args.task, full_report=args.full))
+        asyncio.run(run_single_task(
+            args.task,
+            full_report=args.full,
+            documents=args.documents,
+            source_urls=args.source_urls,
+            persistent=args.persistent,
+        ))
     else:
-        asyncio.run(run_interactive_session(full_report=args.full))
+        asyncio.run(run_interactive_session(full_report=args.full, persistent=args.persistent))
 
 
 if __name__ == "__main__":

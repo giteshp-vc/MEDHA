@@ -25,6 +25,10 @@ htmlcov/
 logs/*
 !logs/.gitkeep
 
+# Persistent execution workspaces and local knowledge corpora
+data/
+documents/
+
 # OS files
 .DS_Store
 Thumbs.db

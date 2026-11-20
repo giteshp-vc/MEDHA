@@ -2,9 +2,11 @@ import logging
 import re
 import sys
 from pathlib import Path
+from logging.handlers import TimedRotatingFileHandler
 from typing import Optional
 
-from config.settings import LOG_LEVEL, LOGS_DIR
+from config.settings import LOG_LEVEL, LOGS_DIR, MEDHA_PERSISTENT_RETENTION_DAYS
+from utils.privacy import is_ephemeral_context
 
 # Sensitive pattern regex (e.g. Google API keys starting with AIza, or bearer tokens)
 SENSITIVE_PATTERNS = [
@@ -17,6 +19,13 @@ class CredentialRedactingFormatter(logging.Formatter):
     """Custom formatter to redact API keys and sensitive credentials from log outputs."""
 
     def format(self, record: logging.LogRecord) -> str:
+        if is_ephemeral_context():
+            record = logging.makeLogRecord(record.__dict__.copy())
+            record.msg = "Execution detail omitted in Ephemeral Mode."
+            record.args = ()
+            record.exc_info = None
+            record.exc_text = None
+            record.stack_info = None
         original = super().format(record)
         redacted = original
         for pattern in SENSITIVE_PATTERNS:
@@ -58,7 +67,14 @@ def setup_logging(
     # File Handler
     target_file = log_file or (LOGS_DIR / "medha.log")
     try:
-        file_handler = logging.FileHandler(target_file, encoding="utf-8")
+        file_handler = TimedRotatingFileHandler(
+            target_file,
+            when="midnight",
+            interval=1,
+            backupCount=MEDHA_PERSISTENT_RETENTION_DAYS,
+            encoding="utf-8",
+            utc=True,
+        )
         file_handler.setLevel(numeric_level)
         file_handler.setFormatter(formatter)
         logger.addHandler(file_handler)

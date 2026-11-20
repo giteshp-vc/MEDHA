@@ -6,11 +6,19 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Optional
 
-from config.settings import LOGS_DIR, MCP_MAX_ACTIVE_JOBS, MCP_MAX_RECORDS
+from config.settings import (
+    LOGS_DIR,
+    MCP_MAX_ACTIVE_JOBS,
+    MCP_MAX_RECORDS,
+    MEDHA_MCP_RESULT_TTL,
+    MEDHA_PERSISTENT_RETENTION_DAYS,
+    MEDHA_STORAGE_MODE,
+)
 from utils.helpers import generate_id
 
 
 ACTIVE_STATUSES = {"QUEUED", "RUNNING"}
+DELIVERY_PENDING_STATUSES = {"AWAITING_DELIVERY"}
 TERMINAL_STATUSES = {
     "COMPLETED",
     "PARTIAL_FAILURE",
@@ -18,7 +26,7 @@ TERMINAL_STATUSES = {
     "CANCELLED",
     "INTERRUPTED",
 }
-VALID_STATUSES = ACTIVE_STATUSES | TERMINAL_STATUSES
+VALID_STATUSES = ACTIVE_STATUSES | DELIVERY_PENDING_STATUSES | TERMINAL_STATUSES
 
 
 def utc_now() -> str:
@@ -68,6 +76,8 @@ class ExecutionRegistry:
         logs_dir: Path = LOGS_DIR,
         max_records: int = MCP_MAX_RECORDS,
         max_active_jobs: int = MCP_MAX_ACTIVE_JOBS,
+        persist_records: Optional[bool] = None,
+        result_ttl_seconds: int = MEDHA_MCP_RESULT_TTL,
     ):
         if max_records < 1:
             raise ValueError("max_records must be at least 1.")
@@ -78,16 +88,25 @@ class ExecutionRegistry:
         self.logs_dir = Path(logs_dir)
         self.max_records = max_records
         self.max_active_jobs = max_active_jobs
+        self.persist_records = (
+            MEDHA_STORAGE_MODE == "persistent"
+            if persist_records is None
+            else persist_records
+        )
+        self.result_ttl_seconds = max(1, int(result_ttl_seconds))
 
         self._jobs: Dict[str, ExecutionJob] = {}
         self._lock = asyncio.Lock()
         self._recovered = False
+        self._watchdog_task: Optional[asyncio.Task] = None
 
     def _record_path(self, job_id: str) -> Path:
         return self.logs_dir / f"mcp_execution_{job_id}.json"
 
     def _persist(self, job: ExecutionJob) -> None:
         """Atomically persist a job record."""
+        if not self.persist_records:
+            return
         self.logs_dir.mkdir(parents=True, exist_ok=True)
 
         target = self._record_path(job.job_id)
@@ -114,7 +133,13 @@ class ExecutionRegistry:
         if self._recovered:
             return
 
+        if not self.persist_records:
+            self._expire_ephemeral_locked()
+            self._recovered = True
+            return
+
         self.logs_dir.mkdir(parents=True, exist_ok=True)
+        self._expire_persistent_records_locked()
         for path in self.logs_dir.glob("mcp_execution_*.json"):
             job_id = path.stem.removeprefix("mcp_execution_")
             if job_id in self._jobs:
@@ -125,7 +150,7 @@ class ExecutionRegistry:
         while len(self._jobs) > self.max_records:
             removable = [
                 job for job in self._jobs.values()
-                if job.status in TERMINAL_STATUSES and job._task_handle is None
+                if job.status in TERMINAL_STATUSES | DELIVERY_PENDING_STATUSES and job._task_handle is None
             ]
             if not removable:
                 break
@@ -136,6 +161,15 @@ class ExecutionRegistry:
             except OSError:
                 pass
         self._recovered = True
+
+    def _expire_persistent_records_locked(self) -> None:
+        cutoff = datetime.now(timezone.utc).timestamp() - MEDHA_PERSISTENT_RETENTION_DAYS * 86400
+        for path in self.logs_dir.glob("mcp_execution_*.json"):
+            try:
+                if path.is_file() and not path.is_symlink() and path.stat().st_mtime < cutoff:
+                    path.unlink()
+            except OSError:
+                continue
 
     def _serialize_result(self, result: Any) -> Dict[str, Any]:
         if hasattr(result, "model_dump"):
@@ -150,11 +184,12 @@ class ExecutionRegistry:
 
     async def _prune_locked(self) -> None:
         """Remove oldest terminal records when memory retention is exceeded."""
+        self._expire_ephemeral_locked()
         while len(self._jobs) > self.max_records:
             removable = [
                 job
                 for job in self._jobs.values()
-                if job.status in TERMINAL_STATUSES
+                if job.status in TERMINAL_STATUSES | DELIVERY_PENDING_STATUSES
                 and job._task_handle is None
             ]
 
@@ -164,11 +199,34 @@ class ExecutionRegistry:
             oldest = min(removable, key=lambda job: job.created_at)
             self._jobs.pop(oldest.job_id, None)
 
+            if self.persist_records:
+                try:
+                    self._record_path(oldest.job_id).unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    def _expire_ephemeral_locked(self) -> None:
+        if self.persist_records:
+            return
+        now = datetime.now(timezone.utc)
+        for job_id, job in list(self._jobs.items()):
+            if job.status not in TERMINAL_STATUSES | DELIVERY_PENDING_STATUSES or not job.finished_at:
+                continue
             try:
-                self._record_path(oldest.job_id).unlink(missing_ok=True)
-            except OSError:
-                # Keep the registry operational if cleanup fails.
-                pass
+                finished = datetime.fromisoformat(job.finished_at)
+            except ValueError:
+                finished = now
+            if (now - finished).total_seconds() >= self.result_ttl_seconds:
+                self._jobs.pop(job_id, None)
+
+    async def _ephemeral_watchdog(self) -> None:
+        try:
+            while True:
+                await asyncio.sleep(min(60, self.result_ttl_seconds))
+                async with self._lock:
+                    self._expire_ephemeral_locked()
+        except asyncio.CancelledError:
+            raise
 
     async def submit(
         self,
@@ -184,6 +242,7 @@ class ExecutionRegistry:
 
         async with self._lock:
             self._recover_all_locked()
+            self._expire_ephemeral_locked()
             active_count = sum(
                 job.status in ACTIVE_STATUSES
                 for job in self._jobs.values()
@@ -200,6 +259,13 @@ class ExecutionRegistry:
 
             self._jobs[job_id] = job
             self._persist(job)
+            if not self.persist_records and (
+                self._watchdog_task is None or self._watchdog_task.done()
+            ):
+                self._watchdog_task = asyncio.create_task(
+                    self._ephemeral_watchdog(),
+                    name="medha-mcp-ephemeral-result-watchdog",
+                )
 
             job._task_handle = asyncio.create_task(
                 self._execute(job_id, runner),
@@ -239,6 +305,8 @@ class ExecutionRegistry:
                 final_status = "PARTIAL_FAILURE"
             else:
                 final_status = "COMPLETED"
+            if not self.persist_records:
+                final_status = "AWAITING_DELIVERY"
 
             async with self._lock:
                 job = self._jobs.get(job_id)
@@ -254,6 +322,8 @@ class ExecutionRegistry:
 
                 job.result = result
                 job.medha_execution_id = result.get("execution_id")
+                if not self.persist_records:
+                    job.task = ""
                 self._set_status(job, final_status)
                 job.finished_at = utc_now()
                 job.updated_at = job.finished_at
@@ -269,6 +339,8 @@ class ExecutionRegistry:
                 if job is not None:
                     self._set_status(job, "CANCELLED")
                     job.error = "Execution was cancelled."
+                    if not self.persist_records:
+                        job.task = ""
                     job.finished_at = utc_now()
                     job.updated_at = job.finished_at
                     job._task_handle = None
@@ -287,7 +359,9 @@ class ExecutionRegistry:
                         self._persist(job)
                         return
                     self._set_status(job, "FAILED")
-                    job.error = f"{type(exc).__name__}: {exc}"
+                    if not self.persist_records:
+                        job.task = ""
+                    job.error = f"{type(exc).__name__}: {exc}" if self.persist_records else type(exc).__name__
                     job.finished_at = utc_now()
                     job.updated_at = job.finished_at
                     job._task_handle = None
@@ -348,6 +422,7 @@ class ExecutionRegistry:
 
         async with self._lock:
             self._recover_all_locked()
+            self._expire_ephemeral_locked()
             job = self._jobs.get(job_id)
 
             if job is None:
@@ -365,6 +440,7 @@ class ExecutionRegistry:
         """List currently retained in-memory jobs."""
         async with self._lock:
             self._recover_all_locked()
+            self._expire_ephemeral_locked()
             return [
                 job.to_dict(include_result=False)
                 for job in self._jobs.values()
@@ -374,14 +450,17 @@ class ExecutionRegistry:
         """Cancel a queued or running job without cancelling unrelated jobs."""
         async with self._lock:
             self._recover_all_locked()
+            self._expire_ephemeral_locked()
             job = self._jobs.get(job_id)
             if job is None:
                 return None
-            if job.status in TERMINAL_STATUSES:
+            if job.status in TERMINAL_STATUSES | DELIVERY_PENDING_STATUSES:
                 return job.to_dict(include_result=False)
 
             self._set_status(job, "CANCELLED")
             job.error = "Execution was cancelled by the MCP client."
+            if not self.persist_records:
+                job.task = ""
             job.finished_at = utc_now()
             task_handle = job._task_handle
             job._task_handle = None
@@ -389,6 +468,23 @@ class ExecutionRegistry:
             if task_handle is not None and not task_handle.done():
                 task_handle.cancel()
             return job.to_dict(include_result=False)
+
+    async def consume_result(self, job_id: str) -> None:
+        """Drop an ephemeral result after it has been delivered to its caller."""
+        if self.persist_records:
+            return
+        async with self._lock:
+            job = self._jobs.get(job_id)
+            if job is not None:
+                medha_status = str((job.result or {}).get("status", "SUCCESS")).upper()
+                job.result = None
+                job.task = ""
+                job.error = None
+                if job.status in DELIVERY_PENDING_STATUSES:
+                    final_status = "FAILED" if medha_status == "FAILED" else (
+                        "PARTIAL_FAILURE" if medha_status == "PARTIAL_FAILURE" else "COMPLETED"
+                    )
+                    self._set_status(job, final_status)
 
     async def shutdown(self) -> None:
         """Cancel active jobs and await their cleanup during server shutdown."""
@@ -401,9 +497,23 @@ class ExecutionRegistry:
             ]
             for handle in handles:
                 handle.cancel()
+            watchdog = self._watchdog_task
+            self._watchdog_task = None
+            if watchdog is not None:
+                watchdog.cancel()
         if handles:
             await asyncio.gather(*handles, return_exceptions=True)
+        if watchdog is not None:
+            await asyncio.gather(watchdog, return_exceptions=True)
+        if not self.persist_records:
+            async with self._lock:
+                self._jobs.clear()
+
+    def clear_ephemeral_state(self) -> None:
+        """Discard Ephemeral registry contents after its transport loop has stopped."""
+        if not self.persist_records:
+            self._jobs.clear()
 
 
 # Shared registry used by the MEDHA MCP server.
-execution_registry = ExecutionRegistry()
+execution_registry = ExecutionRegistry(persist_records=MEDHA_STORAGE_MODE == "persistent")

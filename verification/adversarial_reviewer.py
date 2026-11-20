@@ -7,7 +7,7 @@ from config import settings
 from config.settings import REVIEW_BATCH_SIZE
 from core.llm_client import BaseLLMClient, LLMClient
 from models.schemas import ClaimKind, ClaimStatus, VerificationDecision
-from models.verification_models import Claim, ReviewFeedback
+from models.verification_models import Claim, DeterministicCheckResult, ReviewFeedback
 from utils.logger import get_logger
 from verification.claim_validator import ClaimValidator
 from verification.evidence_ledger import EvidenceLedger
@@ -30,6 +30,7 @@ class AdversarialReviewer:
         self.reviewer_agent = reviewer_agent or ReviewerAgent(llm_client=self.client)
         self.validator = ClaimValidator()
         self.batch_size = max(1, batch_size)
+        self.deterministic_checks: List[DeterministicCheckResult] = []
 
     async def review_claims(
         self,
@@ -85,10 +86,19 @@ class AdversarialReviewer:
                         critique="Verification audit could not be mapped to claim ID.",
                         is_supported_by_evidence=False,
                     )
+                feedback.llm_decision = feedback.decision
 
                 # Heuristic validation: flag superlatives or ungrounded absolutes
                 ev_items = evidence_by_claim.get(claim.claim_id, [])
                 is_structurally_valid, issues = self.validator.validate_claim_structure(claim, evidence_items=ev_items)
+                structural_check = DeterministicCheckResult(
+                    claim_id=claim.claim_id,
+                    checker="claim_structure_and_provenance",
+                    outcome="PASS" if is_structurally_valid else "FLAG",
+                    findings=issues,
+                )
+                self.deterministic_checks.append(structural_check)
+                feedback.deterministic_check_ids.append(structural_check.check_id)
                 if not is_structurally_valid and feedback.decision == VerificationDecision.ACCEPT:
                     feedback.decision = VerificationDecision.REQUEST_REVISION
                     feedback.reasoning += f" [Heuristic Flag: {'; '.join(issues)}]"
@@ -102,6 +112,14 @@ class AdversarialReviewer:
                     ClaimKind.ASSUMPTION,
                     ClaimKind.RECOMMENDATION,
                 ):
+                    category_check = DeterministicCheckResult(
+                        claim_id=claim.claim_id,
+                        checker="claim_kind_policy",
+                        outcome="FLAG",
+                        findings=[f"{claim.claim_kind} cannot be accepted as an established factual result."],
+                    )
+                    self.deterministic_checks.append(category_check)
+                    feedback.deterministic_check_ids.append(category_check.check_id)
                     feedback.decision = VerificationDecision.REQUEST_REVISION
                     feedback.reasoning += (
                         f" [Heuristic Flag: {claim.claim_kind} cannot be accepted as an established factual result.]"
@@ -111,12 +129,24 @@ class AdversarialReviewer:
                         + " Keep this explicitly labeled as a target, assumption, or recommendation."
                     )
 
-                if (
-                    feedback.decision == VerificationDecision.ACCEPT
-                    and settings.VERIFICATION_MODE == "general"
+                numeric_claim_needs_source = (
+                    settings.VERIFICATION_MODE == "general"
                     and not ev_items
-                    and NUMERIC_CLAIM_PATTERN.search(claim.claim_text)
-                ):
+                    and bool(NUMERIC_CLAIM_PATTERN.search(claim.claim_text))
+                )
+                if numeric_claim_needs_source or NUMERIC_CLAIM_PATTERN.search(claim.claim_text):
+                    numeric_check = DeterministicCheckResult(
+                        claim_id=claim.claim_id,
+                        checker="unsourced_numeric_claim",
+                        outcome="FLAG" if numeric_claim_needs_source else "NOT_APPLICABLE",
+                        findings=(
+                            ["Numeric or quantitative claim lacks registered evidence in general mode."]
+                            if numeric_claim_needs_source else []
+                        ),
+                    )
+                    self.deterministic_checks.append(numeric_check)
+                    feedback.deterministic_check_ids.append(numeric_check.check_id)
+                if feedback.decision == VerificationDecision.ACCEPT and numeric_claim_needs_source:
                     feedback.decision = VerificationDecision.REQUEST_REVISION
                     feedback.reasoning += (
                         " [Heuristic Flag: numeric or quantitative claims need registered evidence even in general mode.]"

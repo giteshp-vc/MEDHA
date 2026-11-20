@@ -3,7 +3,14 @@ from typing import Any, Dict, List, Optional
 
 from config.settings import MAX_CLAIMS_PER_TASK
 from models.schemas import ClaimStatus, EvidenceSourceType
-from models.verification_models import Claim, Evidence, RepairAttempt, ReviewFeedback, VerificationReport
+from models.verification_models import (
+    Claim,
+    DeterministicCheckResult,
+    Evidence,
+    RepairAttempt,
+    ReviewFeedback,
+    VerificationReport,
+)
 from utils.helpers import utcnow_iso
 from utils.logger import get_logger
 
@@ -177,6 +184,7 @@ class EvidenceLedger:
         self,
         review_decisions: Optional[List[ReviewFeedback]] = None,
         repair_history: Optional[List[RepairAttempt]] = None,
+        deterministic_checks: Optional[List[DeterministicCheckResult]] = None,
     ) -> VerificationReport:
         """Synthesize a complete verification audit report with rigorous support rate calculation.
 
@@ -238,6 +246,7 @@ class EvidenceLedger:
                 unverifiable_claims=unverifiable,
                 unreviewed_claims=unreviewed,
                 review_decisions=review_decisions or [],
+                deterministic_checks=deterministic_checks or [],
                 repair_history=repairs,
                 support_rate=support_rate,
                 unsupported_rate=unsupported_rate,

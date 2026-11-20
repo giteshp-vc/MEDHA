@@ -10,6 +10,7 @@ from models.schemas import BaseSchema
 from utils.helpers import generate_id, utcnow_iso
 from utils.logger import ExecutionRecord, get_logger
 from utils.token_tracker import TokenTracker
+from utils.privacy import active_storage_mode, current_storage_mode, storage_mode_context
 
 logger = get_logger("baseline")
 
@@ -52,6 +53,7 @@ class SingleAgentBaseline:
         llm_client: Optional[BaseLLMClient] = None,
         model: Optional[str] = None,
         temperature: float = 0.2,
+        storage_mode: Optional[str] = None,
     ):
         if llm_client is not None:
             self.client = llm_client
@@ -61,6 +63,7 @@ class SingleAgentBaseline:
             self.client = create_llm_client(token_tracker=self.tracker)
         self.model = model or self.client.default_model
         self.temperature = temperature
+        self.storage_mode = storage_mode or current_storage_mode()
 
     def benchmark_configuration(self) -> Dict[str, Any]:
         tracker = self.client.get_token_tracker()
@@ -77,6 +80,16 @@ class SingleAgentBaseline:
         }
 
     async def run(
+        self,
+        task: str,
+        accounting_context: Optional[AccountingContext] = None,
+        storage_mode: Optional[str] = None,
+    ) -> BaselineResult:
+        mode = storage_mode or active_storage_mode() or self.storage_mode
+        with storage_mode_context(mode):
+            return await self._run(task, accounting_context=accounting_context)
+
+    async def _run(
         self,
         task: str,
         accounting_context: Optional[AccountingContext] = None,

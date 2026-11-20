@@ -71,6 +71,7 @@ class ExecutionEngine:
         shared_context: SharedContext,
         task_id: str = "",
         execution_policy: Optional[ExecutionPolicy] = None,
+        retriever: Optional[Any] = None,
     ) -> List[TaskResult]:
         """Execute all planned subtasks respecting dependencies, running parallel stages concurrently."""
         policy = execution_policy or ExecutionPolicy()
@@ -124,6 +125,7 @@ class ExecutionEngine:
                         shared_context=shared_context,
                         task_id=task_id,
                         execution_policy=policy,
+                        retriever=retriever,
                     ),
                     name=f"medha-subtask-{subtask.id}",
                 ): subtask
@@ -337,6 +339,7 @@ class ExecutionEngine:
         shared_context: SharedContext,
         task_id: str,
         execution_policy: ExecutionPolicy,
+        retriever: Optional[Any] = None,
     ) -> TaskResult:
         """Run a single specialist agent within concurrency limits and error isolation."""
         async with self.semaphore:
@@ -365,10 +368,37 @@ class ExecutionEngine:
                 )
                 incoming_notes = "\n".join(f"[{m.sender_id}]: {m.content}" for m in pending_messages)
 
+                retrieved_evidence = []
+                retrieval_diagnostics: List[str] = []
+                if retriever is not None:
+                    query = "\n".join((
+                        shared_context.task_description,
+                        f"Role: {subtask.role}",
+                        f"Objective: {subtask.objective}",
+                        subtask.instructions,
+                    ))
+                    try:
+                        retrieved_evidence = [
+                            item.to_evidence_dict()
+                            for item in await retriever.retrieve(query)
+                        ]
+                    except Exception as error:
+                        retrieval_diagnostics.append(
+                            f"Retrieval unavailable for subtask {subtask.id} ({type(error).__name__}); continued without retrieved sources."
+                        )
+                        logger.warning(
+                            "Retrieval unavailable for subtask [%s] (%s); continuing without retrieved sources.",
+                            subtask.id,
+                            type(error).__name__,
+                        )
+
                 context: Dict[str, Any] = {
                     "upstream_results": upstream_results,
                     "shared_notes": incoming_notes,
                     "task_description": shared_context.task_description,
+                    "retrieved_evidence": retrieved_evidence,
+                    "retrieval_attempted": retriever is not None,
+                    "retrieval_error": retrieval_diagnostics[0] if retrieval_diagnostics else None,
                 }
 
                 # Execute specialist agent
@@ -425,6 +455,16 @@ class ExecutionEngine:
                         await shared_context.add_communication(evidence_message.model_dump(mode="json"))
 
                 duration = round(time.perf_counter() - start_time, 3)
+                cited_refs = {str(reference).strip() for reference in response.evidence_references}
+                cited_retrieval = [
+                    {
+                        **item,
+                        "reference": item["source_reference"],
+                        "source": "retrieved_source",
+                    }
+                    for item in retrieved_evidence
+                    if item["chunk_id"] in cited_refs or item["source_id"] in cited_refs
+                ]
 
                 return TaskResult(
                     subtask_id=subtask.id,
@@ -434,7 +474,15 @@ class ExecutionEngine:
                     output=response.content,
                     findings=response.findings,
                     claims=response.claims,
-                    evidence_items=[{"reference": ref, "source": "agent_reasoning"} for ref in response.evidence_references],
+                    evidence_items=[
+                        *[{
+                            "reference": ref,
+                            "source": "agent_reasoning",
+                            "source_type": "REASONING_INFERENCE",
+                        } for ref in response.evidence_references if ref not in cited_refs],
+                        *cited_retrieval,
+                    ],
+                    retrieval_diagnostics=retrieval_diagnostics,
                     assumptions=response.assumptions,
                     unresolved_questions=response.unresolved_questions,
                     duration_seconds=duration,

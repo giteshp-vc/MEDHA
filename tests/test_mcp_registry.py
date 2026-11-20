@@ -7,7 +7,7 @@ from mcp_server.registry import ExecutionRegistry
 
 @pytest.mark.asyncio
 async def test_submit_and_complete(tmp_path):
-    registry = ExecutionRegistry(logs_dir=tmp_path)
+    registry = ExecutionRegistry(logs_dir=tmp_path, persist_records=True)
 
     async def runner():
         await asyncio.sleep(0.01)
@@ -36,7 +36,7 @@ async def test_submit_and_complete(tmp_path):
 
 @pytest.mark.asyncio
 async def test_failed_execution(tmp_path):
-    registry = ExecutionRegistry(logs_dir=tmp_path)
+    registry = ExecutionRegistry(logs_dir=tmp_path, persist_records=True)
 
     async def runner():
         raise RuntimeError("Simulated failure")
@@ -57,7 +57,7 @@ async def test_failed_execution(tmp_path):
 
 @pytest.mark.asyncio
 async def test_persistent_result_recovery(tmp_path):
-    registry = ExecutionRegistry(logs_dir=tmp_path)
+    registry = ExecutionRegistry(logs_dir=tmp_path, persist_records=True)
 
     async def runner():
         return {
@@ -79,7 +79,7 @@ async def test_persistent_result_recovery(tmp_path):
 
         await asyncio.sleep(0.01)
 
-    new_registry = ExecutionRegistry(logs_dir=tmp_path)
+    new_registry = ExecutionRegistry(logs_dir=tmp_path, persist_records=True)
 
     recovered = await new_registry.get_job(
         submitted["job_id"],
@@ -92,7 +92,7 @@ async def test_persistent_result_recovery(tmp_path):
 
 @pytest.mark.asyncio
 async def test_interrupted_execution_recovery(tmp_path):
-    registry = ExecutionRegistry(logs_dir=tmp_path)
+    registry = ExecutionRegistry(logs_dir=tmp_path, persist_records=True)
 
     async def runner():
         await asyncio.sleep(10)
@@ -108,7 +108,7 @@ async def test_interrupted_execution_recovery(tmp_path):
         await asyncio.sleep(0.01)
 
     # Simulate a new server process.
-    new_registry = ExecutionRegistry(logs_dir=tmp_path)
+    new_registry = ExecutionRegistry(logs_dir=tmp_path, persist_records=True)
 
     recovered = await new_registry.get_job(submitted["job_id"])
 

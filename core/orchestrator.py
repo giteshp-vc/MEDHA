@@ -1,5 +1,6 @@
 import asyncio
 import time
+from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 
@@ -7,6 +8,7 @@ from communication.message_bus import MessageBus
 from communication.deliberation_coordinator import DeliberationCoordinator
 from communication.deliberation_policy import temporary_claim_reference
 from communication.shared_context import SharedContext
+from config import settings
 from config.settings import (
     EXECUTION_TIMEOUT_SECONDS,
     MAX_CONCURRENT_AGENTS,
@@ -27,8 +29,10 @@ from models.task_models import TaskPlan, TaskResult
 from models.verification_models import Claim, Evidence, RepairAttempt, ReviewFeedback
 from utils.helpers import generate_id, utcnow_iso
 from utils.logger import ExecutionRecord, get_logger
+from utils.privacy import active_storage_mode, current_storage_mode, storage_mode_context
 from utils.retry import LLMBudgetExceededError, LLMQuotaExhaustedError
 from utils.token_tracker import TokenTracker
+from storage.workspace import CleanupResult, ExecutionWorkspace, ExecutionWorkspaceManager
 from verification.adversarial_reviewer import AdversarialReviewer
 from verification.claim_extractor import ClaimExtractor
 from verification.evidence_ledger import EvidenceLedger
@@ -121,6 +125,10 @@ class MedhaResult(BaseSchema):
     claim_extraction_errors: List[str] = Field(default_factory=list)
     verification_report: Dict[str, Any] = Field(default_factory=dict)
     workflow_stages: List[Dict[str, Any]] = Field(default_factory=list)
+    retrieval_diagnostics: List[str] = Field(default_factory=list)
+    storage_mode: str = "ephemeral"
+    cleanup_verified: Optional[bool] = None
+    cleanup_error: Optional[str] = None
     error: Optional[str] = None
 
 
@@ -133,6 +141,7 @@ class MedhaOrchestrator:
         max_concurrency: int = MAX_CONCURRENT_AGENTS,
         max_repair_iterations: int = MAX_REPAIR_ITERATIONS,
         timeout_seconds: float = EXECUTION_TIMEOUT_SECONDS,
+        storage_mode: Optional[str] = None,
     ):
         if llm_client is not None:
             self.client = llm_client
@@ -143,24 +152,177 @@ class MedhaOrchestrator:
         self.max_concurrency = max_concurrency
         self.max_repair_iterations = max_repair_iterations
         self.timeout_seconds = timeout_seconds
+        self.storage_mode = (storage_mode or current_storage_mode()).strip().lower()
+        if self.storage_mode not in ("ephemeral", "persistent"):
+            raise ValueError("storage_mode must be 'ephemeral' or 'persistent'.")
 
-    async def run_task(self, user_input: str) -> MedhaResult:
-        execution_id = generate_id("exec")
-        with self.tracker.call_context(execution_id=execution_id):
-            async with self.tracker.task_budget():
-                return await self._run_task(
-                    user_input,
-                    policy=OrchestrationPolicy(),
-                    execution_id=execution_id,
+    @asynccontextmanager
+    async def _execution_workspace(
+        self,
+        execution_id: str,
+        storage_mode: Optional[str] = None,
+    ):
+        mode = (storage_mode or active_storage_mode() or self.storage_mode).strip().lower()
+        manager = ExecutionWorkspaceManager(mode=mode)
+        manager.cleanup_abandoned()
+        workspace = manager.create(execution_id)
+        manager.start_watchdog()
+        try:
+            with storage_mode_context(mode):
+                try:
+                    yield workspace
+                finally:
+                    workspace.close()
+        finally:
+            await manager.stop_watchdog()
+
+    async def _build_retriever(
+        self,
+        workspace: ExecutionWorkspace,
+        documents: Optional[List[str]],
+        source_urls: Optional[List[str]],
+        allowed_document_root: Optional[str] = None,
+    ):
+        if not documents and not source_urls:
+            return None, []
+        if not settings.MEDHA_RETRIEVAL_ENABLED:
+            return None, ["Retrieval was disabled; supplied sources were not used."]
+        from retrieval.embedding_engine import EmbeddingUnavailableError
+        from retrieval.retriever import HybridRetriever, RetrievalError
+
+        try:
+            retriever = HybridRetriever.for_workspace(workspace)
+        except Exception as error:
+            return None, [f"Retrieval index initialization failed ({type(error).__name__})."]
+
+        diagnostics: List[str] = []
+        for path in documents or []:
+            try:
+                await asyncio.to_thread(
+                    retriever.ingest_local_async,
+                    [path],
+                    allowed_document_root,
                 )
+            except (EmbeddingUnavailableError, RetrievalError, OSError, ValueError) as error:
+                diagnostics.append(f"Local source was skipped ({type(error).__name__}).")
+            except Exception as error:
+                diagnostics.append(f"Local source ingestion failed ({type(error).__name__}).")
+        for url in source_urls or []:
+            try:
+                await retriever.ingest_urls([url])
+            except (EmbeddingUnavailableError, RetrievalError, OSError, ValueError) as error:
+                diagnostics.append(f"Approved online source was skipped ({type(error).__name__}).")
+            except Exception as error:
+                diagnostics.append(f"Approved online source retrieval failed ({type(error).__name__}).")
+        return retriever, diagnostics
+
+    @staticmethod
+    def _apply_cleanup_result(result: MedhaResult, cleanup: Optional[CleanupResult]) -> None:
+        if cleanup is None:
+            result.cleanup_verified = False
+            result.cleanup_error = "Workspace cleanup did not return a verification result."
+            if result.status != "FAILED":
+                result.status = "PARTIAL_FAILURE"
+            return
+        if cleanup.mode == "persistent":
+            result.cleanup_verified = None
+            result.cleanup_error = cleanup.error
+            if cleanup.error:
+                result.status = "PARTIAL_FAILURE"
+                result.error = "Persistent workspace state could not be finalized cleanly."
+            return
+        result.cleanup_verified = cleanup.verified
+        result.cleanup_error = cleanup.error
+        if cleanup.verified and cleanup.error is None:
+            return
+        result.cleanup_error = cleanup.error or "Workspace still exists after cleanup."
+        result.status = "PARTIAL_FAILURE"
+        result.error = "Execution completed, but ephemeral workspace cleanup could not be verified."
+
+    @staticmethod
+    def _execution_failure_result(execution_id: str, task: str, error: Exception, storage_mode: str) -> MedhaResult:
+        category = type(error).__name__
+        return MedhaResult(
+            execution_id=execution_id,
+            task=task,
+            final_answer=(
+                "# Execution Failure Report\n\n"
+                "MEDHA could not start or complete this task. No execution result is being presented as verified.\n\n"
+                f"Failure category: {category}."
+            ),
+            status="FAILED",
+            error=f"Execution setup failed ({category}).",
+            storage_mode=storage_mode,
+        )
+
+    async def run_task(
+        self,
+        user_input: str,
+        documents: Optional[List[str]] = None,
+        source_urls: Optional[List[str]] = None,
+        storage_mode: Optional[str] = None,
+        allowed_document_root: Optional[str] = None,
+    ) -> MedhaResult:
+        execution_id = generate_id("exec")
+        mode = (storage_mode or active_storage_mode() or self.storage_mode).strip().lower()
+        result: Optional[MedhaResult] = None
+        workspace: Optional[ExecutionWorkspace] = None
+        try:
+            async with self._execution_workspace(execution_id, storage_mode=mode) as workspace:
+                retriever, retrieval_diagnostics = await self._build_retriever(
+                    workspace,
+                    documents,
+                    source_urls,
+                    allowed_document_root=allowed_document_root,
+                )
+                with self.tracker.call_context(execution_id=execution_id):
+                    async with self.tracker.task_budget():
+                        result = await self._run_task(
+                            user_input,
+                            policy=OrchestrationPolicy(),
+                            execution_id=execution_id,
+                            retriever=retriever,
+                            retrieval_diagnostics=retrieval_diagnostics,
+                        )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            result = self._execution_failure_result(execution_id, user_input, error, mode)
+        if result is None:
+            result = self._execution_failure_result(
+                execution_id, user_input, RuntimeError("No result was produced."), mode
+            )
+        self._apply_cleanup_result(result, workspace.cleanup_result if workspace else None)
+        result.storage_mode = mode
+        return result
 
     async def prepare_frozen_plan(
         self,
         user_input: str,
         accounting_context: Optional[AccountingContext] = None,
+        storage_mode: Optional[str] = None,
+    ) -> FrozenTaskPlan:
+        planning_execution_id = generate_id("exec_plan")
+        async with self._execution_workspace(
+            planning_execution_id,
+            storage_mode=storage_mode or active_storage_mode() or self.storage_mode,
+        ) as workspace:
+            result = await self._prepare_frozen_plan_in_workspace(
+                user_input,
+                planning_execution_id,
+                accounting_context,
+            )
+        if workspace.cleanup_result is None or not workspace.cleanup_result.verified:
+            raise RuntimeError("Plan-preparation workspace cleanup could not be verified.")
+        return result
+
+    async def _prepare_frozen_plan_in_workspace(
+        self,
+        user_input: str,
+        planning_execution_id: str,
+        accounting_context: Optional[AccountingContext] = None,
     ) -> FrozenTaskPlan:
         """Generate and validate one reusable, deterministic plan artifact for a task."""
-        planning_execution_id = generate_id("exec_plan")
         base_context = accounting_context or AccountingContext()
         context_values = base_context.model_dump(exclude_none=True)
         context_values.pop("trial_id", None)
@@ -252,6 +414,7 @@ class MedhaOrchestrator:
         frozen_plan: FrozenTaskPlan,
         policy: OrchestrationPolicy,
         accounting_context: Optional[AccountingContext] = None,
+        storage_mode: Optional[str] = None,
     ) -> MedhaResult:
         """Run the multi-agent lifecycle against a previously prepared frozen plan."""
         if not policy.verification_enabled or not policy.synthesis_enabled:
@@ -267,27 +430,37 @@ class MedhaOrchestrator:
             "execution_id": execution_id,
             "scope_kind": "trial_execution",
         })
+        mode = (storage_mode or active_storage_mode() or self.storage_mode).strip().lower()
+        result = None
+        workspace = None
         with self.tracker.call_context(execution_id=execution_id):
-            async with self.tracker.accounting_session(trial_context) as accounting_scope:
-                try:
-                    async with self.tracker.task_budget():
-                        result = await self._run_task(
-                            user_input,
-                            frozen_plan=frozen_plan,
-                            policy=policy,
-                            execution_id=execution_id,
-                        )
-                        trial_accounting = accounting_scope.snapshot()
-                    result.accounting = trial_accounting
-                    result.provider_call_records = result.accounting.provider_calls
-                    result.token_usage = result.accounting.token_usage
-                    return result
-                except asyncio.CancelledError as error:
+            async with self._execution_workspace(execution_id, storage_mode=mode) as workspace:
+                retriever = None
+                async with self.tracker.accounting_session(trial_context) as accounting_scope:
                     try:
-                        error.accounting_snapshot = accounting_scope.snapshot()
-                    except Exception:
-                        pass
-                    raise
+                        async with self.tracker.task_budget():
+                            result = await self._run_task(
+                                user_input,
+                                frozen_plan=frozen_plan,
+                                policy=policy,
+                                execution_id=execution_id,
+                                retriever=retriever,
+                            )
+                            trial_accounting = accounting_scope.snapshot()
+                        result.accounting = trial_accounting
+                        result.provider_call_records = result.accounting.provider_calls
+                        result.token_usage = result.accounting.token_usage
+                    except asyncio.CancelledError as error:
+                        try:
+                            error.accounting_snapshot = accounting_scope.snapshot()
+                        except Exception:
+                            pass
+                        raise
+        if result is None:
+            result = self._execution_failure_result(execution_id, user_input, RuntimeError("No result."), mode)
+        self._apply_cleanup_result(result, workspace.cleanup_result if workspace else None)
+        result.storage_mode = mode
+        return result
 
     async def _run_task(
         self,
@@ -295,6 +468,8 @@ class MedhaOrchestrator:
         frozen_plan: Optional[FrozenTaskPlan] = None,
         policy: Optional[OrchestrationPolicy] = None,
         execution_id: Optional[str] = None,
+        retriever: Optional[Any] = None,
+        retrieval_diagnostics: Optional[List[str]] = None,
     ) -> MedhaResult:
         """Execute the end-to-end evidence-driven multi-agent lifecycle for a given user task."""
         policy = policy or OrchestrationPolicy()
@@ -308,10 +483,13 @@ class MedhaOrchestrator:
 
         ledger = EvidenceLedger(task_id=execution_id)
         review_feedbacks: List[ReviewFeedback] = []
+        deterministic_check_results = []
+        reviewer: Optional[AdversarialReviewer] = None
         repair_attempts: List[RepairAttempt] = []
         claim_extraction_errors: List[str] = []
         quota_interrupted_note: Optional[str] = None
         task_results: List[TaskResult] = []
+        retrieval_diagnostics = list(retrieval_diagnostics or [])
         deliberation_report: Optional[DeliberationReport] = None
         plan_artifact = frozen_plan
         agent_factory = AgentFactory(llm_client=self.client)
@@ -355,6 +533,7 @@ class MedhaOrchestrator:
                     shared_context=shared_context,
                     task_id=execution_id,
                     execution_policy=policy.execution,
+                    retriever=retriever,
                 )
 
             # Log agent activity to execution record
@@ -375,6 +554,11 @@ class MedhaOrchestrator:
             # -------------------------------------------------------------
             completed_tasks = [r for r in task_results if str(r.status) == "COMPLETED" and not r.error]
             failed_tasks = [r for r in task_results if str(r.status) != "COMPLETED" or r.error]
+            retrieval_diagnostics.extend(
+                diagnostic
+                for result in task_results
+                for diagnostic in result.retrieval_diagnostics
+            )
 
             if not completed_tasks:
                 execution_status = "FAILED"
@@ -384,6 +568,12 @@ class MedhaOrchestrator:
                 execution_status = "SUCCESS"
 
             execution_notices = [quota_interrupted_note] if quota_interrupted_note else []
+            if retrieval_diagnostics:
+                execution_notices.append(
+                    "Knowledge retrieval incomplete: " + " | ".join(retrieval_diagnostics)
+                )
+                if completed_tasks and execution_status == "SUCCESS":
+                    execution_status = "PARTIAL_FAILURE"
             if failed_tasks:
                 execution_notices.append(
                     "Some specialist subtasks failed or were dependency-blocked: "
@@ -541,12 +731,36 @@ class MedhaOrchestrator:
                 for ev_item in getattr(result, "evidence_items", []):
                     ref_text = ev_item.get("reference") if isinstance(ev_item, dict) else str(ev_item)
                     if ref_text:
+                        try:
+                            evidence_source = EvidenceSourceType(
+                                ev_item.get("source_type", EvidenceSourceType.REASONING_INFERENCE)
+                            ) if isinstance(ev_item, dict) else EvidenceSourceType.REASONING_INFERENCE
+                        except ValueError:
+                            evidence_source = EvidenceSourceType.REASONING_INFERENCE
                         ev = Evidence(
-                            source_type=EvidenceSourceType.REASONING_INFERENCE,
-                            source_reference=f"Specialist [{result.role}] analytical derivation",
-                            supporting_content=ref_text,
+                            evidence_id=(ev_item.get("evidence_id") if isinstance(ev_item, dict) else None) or generate_id("ev"),
+                            source_type=evidence_source,
+                            source_reference=(
+                                ev_item.get("source_reference") or ref_text
+                                if isinstance(ev_item, dict)
+                                else f"Specialist [{result.role}] analytical derivation"
+                            ),
+                            supporting_content=(
+                                ev_item.get("supporting_content") or ref_text
+                                if isinstance(ev_item, dict)
+                                else ref_text
+                            ),
                             originating_agent=result.agent_id,
                             associated_claim_ids=claim_ids,
+                            artifact_type=ev_item.get("content_type") if isinstance(ev_item, dict) else None,
+                            source_identifier=ev_item.get("source_identifier") if isinstance(ev_item, dict) else None,
+                            retrieval_timestamp=ev_item.get("retrieval_timestamp") if isinstance(ev_item, dict) else None,
+                            evidence_location=ev_item.get("evidence_location") if isinstance(ev_item, dict) else None,
+                            metadata=(
+                                {key: ev_item[key] for key in ("source_id", "chunk_id", "chunk_index", "relevance_score") if key in ev_item}
+                                if isinstance(ev_item, dict)
+                                else {}
+                            ),
                         )
                         await ledger.register_evidence(ev)
                         for claim in extracted_claims:
@@ -728,6 +942,9 @@ class MedhaOrchestrator:
                     if completed_tasks:
                         execution_status = "PARTIAL_FAILURE"
 
+                if reviewer is not None:
+                    deterministic_check_results = list(reviewer.deterministic_checks)
+
             if claim_extraction_errors and completed_tasks and execution_status == "SUCCESS":
                 execution_status = "PARTIAL_FAILURE"
 
@@ -738,6 +955,7 @@ class MedhaOrchestrator:
             verification_report = await ledger.generate_report(
                 review_decisions=review_feedbacks,
                 repair_history=repair_attempts,
+                deterministic_checks=deterministic_check_results,
             )
 
             # Collect unresolved questions from results and agents
@@ -847,6 +1065,7 @@ class MedhaOrchestrator:
                 repair_history=[ra.model_dump() for ra in repair_attempts],
                 unresolved_questions=all_questions,
                 claim_extraction_errors=claim_extraction_errors,
+                retrieval_diagnostics=retrieval_diagnostics,
                 verification_report=verification_report.model_dump(),
                 workflow_stages=workflow.get_summary(),
                 error=quota_interrupted_note,

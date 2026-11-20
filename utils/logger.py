@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional
 
 from config.logging_config import setup_logging
 from config.settings import LOGS_DIR
+from utils.privacy import current_storage_mode, is_ephemeral_context
 
 # Root MEDHA logger initialized once
 _root_logger = setup_logging()
@@ -96,8 +97,14 @@ class ExecutionRecord:
             "metadata": self.metadata,
         }
 
-    def save(self, filepath: Optional[Path] = None) -> Path:
+    def save(
+        self,
+        filepath: Optional[Path] = None,
+        persistent: Optional[bool] = None,
+    ) -> Optional[Path]:
         """Persist structured execution record to a JSON log file."""
+        if current_storage_mode() != "persistent" or persistent is False:
+            return None
         target = filepath or (LOGS_DIR / f"execution_{self.execution_id}.json")
         target.parent.mkdir(parents=True, exist_ok=True)
         with open(target, "w", encoding="utf-8") as f:

@@ -347,6 +347,119 @@ async def test_dependency_agent_consumes_prior_finding_from_message_bus():
 
 
 @pytest.mark.asyncio
+async def test_retrieved_excerpt_is_passed_to_specialist_and_only_cited_source_is_attached():
+    from types import SimpleNamespace
+
+    factory = MagicMock()
+    contexts = {}
+    source = {
+        "chunk_id": "chunk_test_1",
+        "evidence_id": "chunk_test_1",
+        "source_id": "source_test",
+        "source_name": "guide.pdf",
+        "source_reference": "C:/approved/guide.pdf",
+        "source_type": "USER_PROVIDED_ARTIFACT",
+        "content_type": "application/pdf",
+        "retrieval_timestamp": "2026-11-20T00:00:00+00:00",
+        "evidence_location": "page 4",
+        "supporting_content": "PostgreSQL supports explicit transactions.",
+    }
+
+    class FakeRetriever:
+        async def retrieve(self, query, limit=None):
+            assert "database migration" in query.lower()
+            return [SimpleNamespace(to_evidence_dict=lambda: source)]
+
+    def create_agent(subtask, task_id=""):
+        agent = MagicMock()
+        agent.agent_id = "agent_retrieval"
+        agent.role = subtask.role
+
+        async def execute(context=None):
+            contexts.update(context or {})
+            return AgentResponse(
+                agent_id=agent.agent_id,
+                role=subtask.role,
+                task_id=task_id,
+                subtask_id=subtask.id,
+                content="Use a transaction for the migration.",
+                claims=["Use a transaction for the migration."],
+                evidence_references=["chunk_test_1"],
+                status=AgentStatus.COMPLETED,
+            )
+
+        agent.execute = execute
+        return agent
+
+    factory.create_from_subtask.side_effect = create_agent
+    plan = TaskPlan(
+        task="Database migration",
+        subtasks=[SubTask(id="T1", role="Database Engineer", objective="Plan database migration")],
+    )
+    results = await ExecutionEngine(max_concurrency=1).execute_plan(
+        plan,
+        factory,
+        MessageBus(),
+        SharedContext(task_id="exec_retrieval", task_description="Database migration"),
+        task_id="exec_retrieval",
+        retriever=FakeRetriever(),
+    )
+
+    assert results[0].status == TaskStatus.COMPLETED
+    assert contexts["retrieved_evidence"][0]["supporting_content"] == source["supporting_content"]
+    assert results[0].evidence_items == [{
+        **source,
+        "reference": source["source_reference"],
+        "source": "retrieved_source",
+    }]
+
+
+@pytest.mark.asyncio
+async def test_retrieval_query_failure_does_not_fail_specialist():
+    factory = MagicMock()
+    received = {}
+
+    class BrokenRetriever:
+        async def retrieve(self, query, limit=None):
+            raise RuntimeError("private source details")
+
+    def create_agent(subtask, task_id=""):
+        agent = MagicMock()
+        agent.agent_id = "agent_retrieval_failure"
+        agent.role = subtask.role
+
+        async def execute(context=None):
+            received.update(context or {})
+            return AgentResponse(
+                agent_id=agent.agent_id,
+                role=subtask.role,
+                task_id=task_id,
+                subtask_id=subtask.id,
+                content="Work continued without sources.",
+                status=AgentStatus.COMPLETED,
+            )
+
+        agent.execute = execute
+        return agent
+
+    factory.create_from_subtask.side_effect = create_agent
+    plan = TaskPlan(task="Example", subtasks=[SubTask(id="T1", role="Analyst", objective="Analyze")])
+    result = await ExecutionEngine(max_concurrency=1).execute_plan(
+        plan,
+        factory,
+        MessageBus(),
+        SharedContext(task_id="exec_retrieval_error", task_description="Example"),
+        task_id="exec_retrieval_error",
+        retriever=BrokenRetriever(),
+    )
+
+    assert result[0].status == TaskStatus.COMPLETED
+    assert result[0].retrieval_diagnostics
+    assert "private source details" not in result[0].retrieval_diagnostics[0]
+    assert "retrieval unavailable" in received["retrieval_error"].lower()
+
+
+@pytest.mark.asyncio
 async def test_independent_parallel_policy_ignores_dependencies_and_message_channels():
     second_started = asyncio.Event()
     contexts = {}

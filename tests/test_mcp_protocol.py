@@ -24,7 +24,7 @@ MOCK_SERVER_SCRIPT = textwrap.dedent(
         def __init__(self, *args, **kwargs):
             pass
 
-        async def run_task(self, task):
+        async def run_task(self, task, **kwargs):
             if task == "raise from mocked orchestrator":
                 raise RuntimeError("mocked orchestrator failure")
             return MedhaResult(
@@ -154,7 +154,8 @@ async def test_real_mcp_stdio_protocol_end_to_end():
                     break
                 await asyncio.sleep(0.01)
             assert failed_status["status"] == "FAILED"
-            assert "mocked orchestrator failure" in failed_status["error"]
+            assert failed_status["error"] == "RuntimeError"
+            assert "mocked orchestrator failure" not in failed_status["error"]
 
             accepted = await _call_json(
                 session,
@@ -170,13 +171,19 @@ async def test_real_mcp_stdio_protocol_end_to_end():
 
             status = None
             result = None
+            report = None
             for _ in range(100):
                 status = await _call_json(
                     session,
                     "get_execution_status",
                     {"execution_id": job_id},
                 )
-                if status["status"] == "COMPLETED":
+                if status["status"] in {"COMPLETED", "AWAITING_DELIVERY"}:
+                    report = await _call_json(
+                        session,
+                        "get_verification_report",
+                        {"execution_id": job_id},
+                    )
                     result = await _call_json(
                         session,
                         "get_execution_result",
@@ -186,15 +193,15 @@ async def test_real_mcp_stdio_protocol_end_to_end():
                         break
                 await asyncio.sleep(0.01)
 
+            status = await _call_json(
+                session,
+                "get_execution_status",
+                {"execution_id": job_id},
+            )
             assert status["status"] == "COMPLETED"
             assert result["result"]["final_answer"] == "Protocol test result"
             assert result["result"]["execution_id"] == "exec_protocol_test"
 
-            report = await _call_json(
-                session,
-                "get_verification_report",
-                {"execution_id": job_id},
-            )
             assert report["job_id"] == job_id
             assert report["total_claims"] == 1
             assert report["unreviewed_claims"]
@@ -210,3 +217,18 @@ async def test_real_mcp_stdio_protocol_end_to_end():
 
             # Closing the session/stdio context is the real shutdown path; the
             # bounded context exit must not leave the server protocol hanging.
+
+
+def test_server_discards_ephemeral_registry_after_transport_stops(monkeypatch):
+    from unittest.mock import MagicMock
+
+    from mcp_server import server
+
+    registry = MagicMock()
+    monkeypatch.setattr(server, "execution_registry", registry)
+    monkeypatch.setattr(server, "cleanup_stale_workspaces", lambda mode: {"failed": 0})
+    monkeypatch.setattr(server.mcp, "run", lambda transport: None)
+
+    server.main()
+
+    registry.clear_ephemeral_state.assert_called_once_with()

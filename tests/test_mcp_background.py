@@ -22,6 +22,7 @@ def create_result():
         task="Test background execution",
         final_answer="Background task completed",
         status="SUCCESS",
+        storage_mode="persistent",
         verification_report={
             "total_claims": 1,
             "accepted_claims": [{"claim_id": "c1"}],
@@ -47,7 +48,7 @@ async def wait_for_status(registry, job_id, expected):
 
 @pytest.mark.asyncio
 async def test_background_submission_and_result(tmp_path):
-    registry = ExecutionRegistry(logs_dir=tmp_path)
+    registry = ExecutionRegistry(logs_dir=tmp_path, persist_records=True)
 
     mock_orchestrator = MagicMock()
     mock_orchestrator.run_task = AsyncMock(return_value=create_result())
@@ -77,8 +78,76 @@ async def test_background_submission_and_result(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_ephemeral_background_result_is_memory_only_and_consumed(tmp_path):
+    registry = ExecutionRegistry(
+        logs_dir=tmp_path,
+        persist_records=False,
+        result_ttl_seconds=60,
+    )
+
+    async def runner():
+        result = create_result()
+        result.storage_mode = "ephemeral"
+        return result
+
+    submitted = await registry.submit("Sensitive task", runner)
+    await wait_for_status(registry, submitted["job_id"], "AWAITING_DELIVERY")
+    assert list(tmp_path.glob("mcp_execution_*.json")) == []
+    retained = await registry.get_job(submitted["job_id"], include_result=True)
+    assert retained["task"] == ""
+    assert retained["result"]["final_answer"] == "Background task completed"
+
+    delivered = await get_execution_result_impl(submitted["job_id"], registry=registry)
+
+    assert delivered["result"]["final_answer"] == "Background task completed"
+    after_delivery = await registry.get_job(submitted["job_id"], include_result=True)
+    assert after_delivery["status"] == "COMPLETED"
+    assert after_delivery["result"] is None
+    assert list(tmp_path.glob("mcp_execution_*.json")) == []
+
+
+@pytest.mark.asyncio
+async def test_unclaimed_ephemeral_result_expires_from_memory(tmp_path):
+    registry = ExecutionRegistry(
+        logs_dir=tmp_path,
+        persist_records=False,
+        result_ttl_seconds=1,
+    )
+
+    async def runner():
+        result = create_result()
+        result.storage_mode = "ephemeral"
+        return result
+
+    submitted = await registry.submit("Unclaimed task", runner)
+    await wait_for_status(registry, submitted["job_id"], "AWAITING_DELIVERY")
+    await asyncio.sleep(1.2)
+
+    assert await registry.get_job(submitted["job_id"], include_result=True) is None
+    assert list(tmp_path.glob("mcp_execution_*.json")) == []
+    await registry.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_ephemeral_shutdown_discards_undelivered_result(tmp_path):
+    registry = ExecutionRegistry(logs_dir=tmp_path, persist_records=False, result_ttl_seconds=60)
+
+    async def runner():
+        result = create_result()
+        result.storage_mode = "ephemeral"
+        return result
+
+    submitted = await registry.submit("Sensitive shutdown task", runner)
+    await wait_for_status(registry, submitted["job_id"], "AWAITING_DELIVERY")
+    await registry.shutdown()
+
+    assert await registry.get_job(submitted["job_id"], include_result=True) is None
+    assert list(tmp_path.glob("mcp_execution_*.json")) == []
+
+
+@pytest.mark.asyncio
 async def test_background_status(tmp_path):
-    registry = ExecutionRegistry(logs_dir=tmp_path)
+    registry = ExecutionRegistry(logs_dir=tmp_path, persist_records=True)
 
     mock_orchestrator = MagicMock()
     mock_orchestrator.run_task = AsyncMock(return_value=create_result())
@@ -102,7 +171,7 @@ async def test_background_status(tmp_path):
 
 @pytest.mark.asyncio
 async def test_verification_report_by_job_id(tmp_path):
-    registry = ExecutionRegistry(logs_dir=tmp_path)
+    registry = ExecutionRegistry(logs_dir=tmp_path, persist_records=True)
 
     mock_orchestrator = MagicMock()
     mock_orchestrator.run_task = AsyncMock(return_value=create_result())
@@ -128,7 +197,7 @@ async def test_verification_report_by_job_id(tmp_path):
 
 @pytest.mark.asyncio
 async def test_invalid_background_task(tmp_path):
-    registry = ExecutionRegistry(logs_dir=tmp_path)
+    registry = ExecutionRegistry(logs_dir=tmp_path, persist_records=True)
 
     result = await start_medha_task_impl(
         "   ",
@@ -161,12 +230,31 @@ async def test_capacity_limit_and_concurrent_submissions(tmp_path):
 
     release.set()
     for submission in submissions:
-        await wait_for_status(registry, submission["job_id"], "COMPLETED")
+        await wait_for_status(registry, submission["job_id"], "AWAITING_DELIVERY")
+        delivered = await get_execution_result_impl(submission["job_id"], registry=registry)
+        assert delivered["result"]["final_answer"] == "Background task completed"
+        completed = await registry.get_job(submission["job_id"])
+        assert completed["status"] == "COMPLETED"
+
+
+@pytest.mark.asyncio
+async def test_failed_ephemeral_execution_clears_task_text(tmp_path):
+    registry = ExecutionRegistry(logs_dir=tmp_path, persist_records=False)
+
+    async def runner():
+        raise RuntimeError("private failure detail")
+
+    submitted = await registry.submit("Sensitive task content", runner)
+    failed = await wait_for_status(registry, submitted["job_id"], "FAILED")
+
+    assert failed["task"] == ""
+    assert failed["error"] == "RuntimeError"
+    assert list(tmp_path.glob("mcp_execution_*.json")) == []
 
 
 @pytest.mark.asyncio
 async def test_failed_background_execution_is_persisted(tmp_path):
-    registry = ExecutionRegistry(logs_dir=tmp_path)
+    registry = ExecutionRegistry(logs_dir=tmp_path, persist_records=True)
 
     async def runner():
         raise RuntimeError("background failure")
@@ -175,7 +263,7 @@ async def test_failed_background_execution_is_persisted(tmp_path):
     failed = await wait_for_status(registry, submitted["job_id"], "FAILED")
 
     assert "RuntimeError: background failure" in failed["error"]
-    recovered = ExecutionRegistry(logs_dir=tmp_path)
+    recovered = ExecutionRegistry(logs_dir=tmp_path, persist_records=True)
     recovered_job = await recovered.get_job(submitted["job_id"])
     assert recovered_job["status"] == "FAILED"
     assert "background failure" in recovered_job["error"]
@@ -183,7 +271,7 @@ async def test_failed_background_execution_is_persisted(tmp_path):
 
 @pytest.mark.asyncio
 async def test_cancellation_is_graceful_and_isolated(tmp_path):
-    registry = ExecutionRegistry(logs_dir=tmp_path)
+    registry = ExecutionRegistry(logs_dir=tmp_path, persist_records=True)
     started = asyncio.Event()
 
     async def runner():
@@ -201,7 +289,7 @@ async def test_cancellation_is_graceful_and_isolated(tmp_path):
 
 @pytest.mark.asyncio
 async def test_completed_result_and_interrupted_job_recover_after_restart(tmp_path):
-    registry = ExecutionRegistry(logs_dir=tmp_path)
+    registry = ExecutionRegistry(logs_dir=tmp_path, persist_records=True)
 
     async def runner():
         return create_result()
@@ -209,7 +297,7 @@ async def test_completed_result_and_interrupted_job_recover_after_restart(tmp_pa
     completed = await registry.submit("Recovery test", runner)
     await wait_for_status(registry, completed["job_id"], "COMPLETED")
 
-    restarted = ExecutionRegistry(logs_dir=tmp_path)
+    restarted = ExecutionRegistry(logs_dir=tmp_path, persist_records=True)
     recovered = await restarted.get_job(completed["job_id"], include_result=True)
     assert recovered["status"] == "COMPLETED"
     assert recovered["result"]["execution_id"] == "exec_background_test"
@@ -235,7 +323,7 @@ async def test_completed_result_and_interrupted_job_recover_after_restart(tmp_pa
 
 @pytest.mark.asyncio
 async def test_verification_report_returns_complete_payload(tmp_path):
-    registry = ExecutionRegistry(logs_dir=tmp_path)
+    registry = ExecutionRegistry(logs_dir=tmp_path, persist_records=True)
     result = create_result()
     result.verification_report.update({
         "unverifiable_claims": [{"claim_id": "c2"}],
@@ -263,7 +351,7 @@ async def test_verification_report_returns_complete_payload(tmp_path):
 
 @pytest.mark.asyncio
 async def test_tool_option_validation(tmp_path):
-    registry = ExecutionRegistry(logs_dir=tmp_path)
+    registry = ExecutionRegistry(logs_dir=tmp_path, persist_records=True)
     invalid_background = await start_medha_task_impl(
         "valid task",
         max_concurrency=0,

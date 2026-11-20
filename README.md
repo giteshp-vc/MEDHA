@@ -3,11 +3,11 @@
 [![Python 3.13](https://img.shields.io/badge/python-3.13-blue.svg)](https://www.python.org/)
 [![Groq API](https://img.shields.io/badge/Primary%20LLM-Groq-green.svg)](https://groq.com/)
 [![Google Gemini API](https://img.shields.io/badge/Alternative%20LLM-Google%20Gemini-orange.svg)](https://ai.google.dev/)
-[![Tests](https://img.shields.io/badge/tests-53%20passed-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-offline%20suite-brightgreen.svg)]()
 [![Model Context Protocol](https://img.shields.io/badge/MCP-2.3.0-purple.svg)](https://modelcontextprotocol.io/)
 
 **SEED Hackathon 2026** | **Problem Statement 02 — Chain of Command**  
-*Topic-Independent, Dynamically Orchestrated Multi-Agent Intelligence with Multi-Provider Architecture & Adversarial Evidence Auditing*
+*Topic-Independent, Dynamically Orchestrated Multi-Agent Intelligence with Local Hybrid Retrieval, Ephemeral Execution Storage, and Adversarial Claim Review*
 
 ---
 
@@ -19,14 +19,18 @@ Traditional LLM workflows and naive multi-agent systems suffer from common failu
 3. **Rigid Predefined Roles**: Fixed agent configurations struggle when encountering novel, multi-disciplinary problems.
 4. **All-or-Nothing Rejection**: When an answer contains a single flaw, the entire output is either rejected or accepted with the flaw intact.
 
-**MEDHA** solves these fundamental issues through a dynamic, evidence-grounded multi-provider architecture:
+**MEDHA** is designed to reduce these issues through a dynamic, evidence-aware multi-provider architecture. It does not guarantee factual correctness; reviewer acceptance is an LLM judgment, not proof.
 - **Multi-Provider LLM Architecture**: Uses **Groq** (`openai/gpt-oss-20b`) as its high-speed primary LLM provider while retaining **Google Gemini** (`gemini-3.8-flash`) as a fully supported alternative.
+- **Local Hybrid Retrieval**: Parses explicitly supplied PDF, DOCX, text, and structured-text sources, combines SQLite FTS5/BM25 keyword ranking with local FastEmbed vector similarity, and returns bounded excerpts with source locations.
+- **Ephemeral-by-Default Storage**: Gives each execution a unique workspace, uses an in-memory retrieval index in Ephemeral Mode, suppresses execution JSON persistence, redacts execution-specific log messages, and verifies cleanup.
 - **Dynamic Specialist Creation**: Analyzes each user task to dynamically determine the exact domain expertise required and creates custom specialist agents on the fly.
 - **Dependency-Aware Parallel Execution**: Automatically derives DAG dependencies, executing independent specialist subtasks concurrently while routing upstream findings to downstream specialists.
 - **Structured Inter-Agent Message Bus**: Agents exchange formal findings, questions, evidence, and challenges across dedicated asynchronous inboxes.
-- **Centralized Evidence Ledger**: Rigorously indexes every concrete assertion as an atomic claim tied to verified supporting evidence and source references.
-- **Independent Adversarial Reviewer**: Audits claims using strict evidentiary criteria (challenging unverified leaps, superlatives, and hidden assumptions) rather than consensus.
+- **Traceable Claim Ledger**: Tracks atomic claims, provenance, references, review status, and history. References are not treated as verified sources until retrieved or supplied with traceable content.
+- **Adversarial LLM Review**: A reviewer role challenges unsupported leaps, absolutes, and hidden assumptions. It is an LLM judgment, not an independent institution or proof engine.
 - **Targeted Precision Repair**: Routes specific reviewer critiques back to the responsible specialist to narrow claims, declare explicit assumptions, or supply valid derivations.
+- **Hybrid Retrieval**: When local documents or allowlisted HTTPS sources are supplied, MEDHA combines SQLite FTS5/BM25 keyword search with local FastEmbed vectors and reciprocal-rank fusion.
+- **Privacy-Conscious Storage**: Ephemeral Mode is the default; per-execution retrieval data uses an isolated in-memory SQLite index and is cleaned after answer delivery.
 - **Transparent Truthful Execution**: Reports truthful statuses (`SUCCESS`, `PARTIAL_FAILURE`, `FAILED`), explicitly discloses when zero claims were available for verification, and never presents unverified fallback text as truth.
 - **Full Model Context Protocol (MCP) Server**: Exposes MEDHA tools over the official MCP Python SDK for seamless integration into external agent environments.
 - **Quantitative Benchmarking Suite**: Evaluates MEDHA against a single-agent baseline on reference criteria coverage, claim support rates, repair efficiency, and token economics.
@@ -37,21 +41,25 @@ Traditional LLM workflows and naive multi-agent systems suffer from common failu
 
 ```mermaid
 flowchart TD
-    User([User Prompt]) --> Planner[Task Planner]
+    User([User Prompt and optional documents]) --> Workspace[Ephemeral execution workspace]
+    Workspace --> Ingest[Parse, chunk, and index supplied sources]
+    Ingest --> Planner[Task Planner]
     Planner -->|Dynamic Decomposition| Plan[Task Plan & DAG]
     
     subgraph ExecutionEngine [Parallel Execution Engine]
-        Plan --> T1[Specialist 1: Architecture]
-        Plan --> T2[Specialist 2: Security]
-        Plan --> T3[Specialist 3: Performance]
-        T1 & T2 -->|Upstream Context| T4[Specialist 4: Integration]
+        Plan --> T1[Specialist 1]
+        Plan --> T2[Specialist 2]
+        T1 & T2 -->|Dependencies| T3[Integrating Specialist]
+        Ingest -->|Relevant excerpts + source IDs| T1
+        Ingest -->|Relevant excerpts + source IDs| T2
+        Ingest -->|Relevant excerpts + source IDs| T3
     end
 
     subgraph Communication [Message Bus & Shared Context]
         T1 <-->|Findings & Challenges| MsgBus[Message Bus]
         T2 <-->|Evidence Sharing| MsgBus
         T3 <-->|Questions & Notes| SharedCtx[Shared Context]
-        T4 <--> MsgBus
+        T3 <--> MsgBus
     end
 
     ExecutionEngine --> Extractor[Claim Extractor]
@@ -67,7 +75,8 @@ flowchart TD
     end
 
     Accepted & Unverifiable --> Synthesizer[Final Synthesizer]
-    Synthesizer --> FinalAnswer([Transparent Truthful Answer])
+    Synthesizer --> FinalAnswer([Answer returned to user])
+    FinalAnswer --> Cleanup[Verify workspace cleanup]
 ```
 
 ---
@@ -78,7 +87,7 @@ flowchart TD
 MEDHA/
 │
 ├── main.py                     # Interactive CLI and application entry point
-├── requirements.txt            # Project dependencies (groq, google-genai, pydantic, mcp)
+├── requirements.txt            # Providers, schemas, MCP, document parsing, and local embeddings
 ├── .env                        # Local configuration and credentials (never committed)
 ├── .env.example                # Example multi-provider environment configuration
 ├── .gitignore                  # Git ignore rules
@@ -114,6 +123,17 @@ MEDHA/
 │   ├── message.py              # Structured inter-agent message schema
 │   ├── message_bus.py          # Asynchronous queue-based message broker
 │   └── shared_context.py       # Thread-safe shared knowledge repository
+│
+├── retrieval/
+│   ├── document_parser.py      # PDF, DOCX, HTML, and text extraction
+│   ├── chunker.py              # Bounded chunks with source location metadata
+│   ├── embedding_engine.py     # Local FastEmbed adapter
+│   ├── store.py                # Per-execution SQLite FTS5/vector index
+│   ├── reranker.py             # Reciprocal-rank fusion
+│   └── retriever.py            # Local and allowlisted HTTPS source ingestion
+│
+├── storage/
+│   └── workspace.py            # Isolated execution workspaces, TTL cleanup, watchdog
 │
 ├── verification/
 │   ├── claim_extractor.py      # Discrete claim and assumption extractor
@@ -158,7 +178,9 @@ MEDHA/
 │   ├── test_mcp.py             # MCP server tool execution tests
 │   └── test_benchmark.py       # Benchmark evaluation and metric tests
 │
-└── logs/                       # Structured JSON execution traces
+├── documents/                  # Optional local MCP document root (user data, ignored)
+├── data/                       # Optional Persistent Mode execution stores (ignored)
+└── logs/                       # Persistent Mode execution traces; Ephemeral Mode skips reports
 ```
 
 ---
@@ -181,6 +203,7 @@ MEDHA/
    ```powershell
    pip install -r requirements.txt
    ```
+    Retrieval uses PyMuPDF and python-docx for parsing, plus FastEmbed for local CPU embeddings. The first retrieval may download the configured embedding model to the machine's shared model cache. This is not a paid embedding API.
 
 3. **Configure credentials in `.env`**:
    Copy `.env.example` to `.env` and configure your chosen provider:
@@ -201,6 +224,8 @@ MEDHA/
    TEMPERATURE=0.2
    ```
 
+Set `MEDHA_ALLOWED_SOURCE_DOMAINS` to a comma-separated allowlist before using `--source-url`. Online fetching is disabled for hosts not on that list.
+
 ---
 
 ## 5. Usage
@@ -214,8 +239,44 @@ python main.py
 ### 2. Direct Task Execution
 Run a single task directly via CLI:
 ```powershell
-python main.py --task "Design a high-throughput financial ledger processing 100k TPS."
+python main.py --task "Explain how database indexes help queries."
 ```
+By default this uses Ephemeral Mode. `--full` prints the complete audit; an execution JSON file is written only in Persistent Mode.
+
+Supply local sources explicitly with repeated `--document` arguments:
+```powershell
+python main.py --task "Summarize the supplied policy." --document .\documents\policy.pdf --document .\documents\appendix.docx
+```
+
+Approved HTTPS sources can be supplied with `--source-url`:
+```powershell
+python main.py --task "Explain the current setting." --source-url https://docs.example.org/guide.html
+```
+The host must be listed in `MEDHA_ALLOWED_SOURCE_DOMAINS`; only HTTPS is accepted, each redirect is rechecked, and non-public IP destinations are rejected. No source is fetched if neither documents nor URLs are provided.
+
+### Execution Storage
+
+- **Ephemeral Mode (default):** per-execution workspace, in-memory SQLite retrieval index, no execution JSON or MCP job files, content-redacted application logs, and cleanup on success, failure, timeout, or cancellation.
+- **Persistent Mode:** opt in with `MEDHA_STORAGE_MODE=persistent` or `--persistent`. Execution records and retrieval indexes may be retained until `MEDHA_PERSISTENT_RETENTION_DAYS` expires.
+
+For MCP, choose `MEDHA_STORAGE_MODE` before starting the server. An ephemeral background result is held in memory while it awaits delivery, then cleared after `get_execution_result`; unclaimed results expire after `MEDHA_MCP_RESULT_TTL` seconds.
+
+Ephemeral Mode is an application-level non-retention policy, not physical erasure. MEDHA cannot delete data already sent to Groq/Gemini, terminal captures, OS swap/crash dumps, backups, or the user's original files. FastEmbed model weights may persist in a shared model cache; they are generic model files, not task content. MEDHA does not encrypt Persistent Mode files at rest.
+
+### Hybrid Knowledge Retrieval
+
+Retrieval is activated only when a task supplies `--document` paths or approved `--source-url` values. MEDHA does not crawl the repository or search the public web automatically.
+
+- Supported local types: PDF, DOCX, TXT, Markdown, reStructuredText, CSV, JSON, and HTML.
+- PDF parsing retains page numbers; DOCX parsing retains section headings where available.
+- Chunks retain source ID, name, reference, chunk ID, page/heading, source type, and retrieval timestamp.
+- SQLite FTS5 provides BM25 keyword ranking. FastEmbed generates local vectors. Reciprocal-rank fusion combines the two rankings; no paid embedding API is used.
+- Only retrieved chunks explicitly cited by a specialist using their exact chunk ID are registered as retrieved evidence for review.
+- The reviewer receives the actual excerpt and source metadata, not just a URL. An agent-generated URL is still unverified until MEDHA fetches it through the approved-source loader.
+- Ephemeral Mode keeps chunks and vectors in an execution-local in-memory SQLite database. Persistent Mode stores an execution-local SQLite index under `data/executions/` and expires it according to the retention setting.
+- The local embedding model may be downloaded on first use and cached outside the execution workspace. It is generic model data, not a document or task artifact.
+
+If no relevant excerpts are found, MEDHA tells the specialist that no registered source was available; it does not fabricate a citation. In Strict mode, unsupported claims should remain unverified. In General mode, limited common-knowledge claims may be accepted but are labeled as not externally evidenced.
 
 ### 3. Single-Agent Baseline
 Run a task using the un-orchestrated single-agent baseline for direct comparison:
@@ -226,9 +287,10 @@ python main.py --baseline "Design a high-throughput financial ledger processing 
 ### 4. Four-Arm Benchmark Suite
 Run the four-arm frozen-plan experiment comparing the single-agent baseline, independent specialists, dependency-aware execution, and full MEDHA:
 ```powershell
-python main.py --benchmark --benchmark-cases 5 --benchmark-repetitions 2 --experiment-id phase52c-smoke
+python main.py --benchmark --persistent --benchmark-cases 2 --benchmark-repetitions 1 --experiment-id pilot-01
 ```
 Each explicit experiment ID produces `benchmark/experiments/<experiment-id>.json` and `.csv`. Existing files are never overwritten. `--benchmark-output` selects a directory within `benchmark/`, for example `--benchmark-output experiments/run-01`.
+Benchmark startup requires `VERIFICATION_MODE=strict` and the explicit `--persistent` flag. Do not run until the dataset, source packets, scoring process, budget, and pre-pilot authorization checklist are approved.
 
 #### Benchmark Status and Protocol
 
@@ -263,18 +325,21 @@ Start MEDHA as a standard MCP server over stdio:
 python main.py --mcp
 ```
 Exposed Tools:
-- `run_medha_task(task: str, max_concurrency: int = 4, max_repair_iterations: int = 2)`
+- `run_medha_task(task: str, max_concurrency: int = 4, max_repair_iterations: int = 2, documents: list[str] = [], source_urls: list[str] = [])`
+- `start_medha_task(task: str, ..., documents: list[str] = [], source_urls: list[str] = [])`
 - `get_execution_status(execution_id: str)`
 - `get_verification_report(execution_id: str)`
 - `run_baseline(task: str, model: str = "")`
+
+In Ephemeral Mode, MCP local document paths must resolve under `MEDHA_DOCUMENTS_DIR`. A background result stays in memory awaiting delivery; fetching it clears task-specific result data. Select Persistent Mode before server startup if durable MCP recovery is required.
 
 ---
 
 ## 6. Truthful Execution Statuses
 
 MEDHA introduces truthful execution reporting to eliminate phantom successes:
-- **`SUCCESS`**: All specialist agents completed successfully, and their extracted claims were verified.
-- **`PARTIAL_FAILURE`**: At least one specialist agent succeeded while others encountered errors. Valid findings are synthesized with transparent disclosure of failed components.
+- **`SUCCESS`**: No qualifying workflow interruption was recorded. This does not mean every claim was supported or factually true.
+- **`PARTIAL_FAILURE`**: Useful work may exist, but a specialist or a critical stage (retrieval, deliberation, extraction, verification, repair, synthesis, or cleanup) was incomplete.
 - **`FAILED`**: Zero specialist subtasks completed successfully. The workflow terminates with a transparent failure report detailing subtask errors and explicitly stating that no claims were available for verification. Fallback text is **never** presented as verified truth.
 
 ---
@@ -302,10 +367,7 @@ Run the test suite:
 ```powershell
 .\.venv\Scripts\pytest -v
 ```
-
-```
-============================= 53 passed in 4.03s ==============================
-```
+Tests use mocked provider responses. Use the actual pytest summary from the current checkout; a passing mock suite does not establish live API reliability or factual accuracy.
 
 ---
 

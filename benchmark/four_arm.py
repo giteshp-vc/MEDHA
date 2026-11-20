@@ -34,6 +34,7 @@ from benchmark.treatments import BenchmarkArm, get_treatment_preset
 from config import settings
 from models.frozen_plan import FrozenTaskPlan
 from models.provider_call import AccountingContext, AccountingSnapshot, ProviderCallRecord
+from utils.privacy import current_storage_mode
 from utils.helpers import utcnow_iso
 
 _SAFE_EXPERIMENT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -301,6 +302,10 @@ class FourArmBenchmark:
         experiment_id = experiment_id or f"exp_{uuid.uuid4().hex[:12]}"
         if not _SAFE_EXPERIMENT_ID.fullmatch(experiment_id) or ".." in experiment_id:
             raise ValueError("experiment_id must contain only letters, digits, dot, underscore, or hyphen.")
+        if current_storage_mode() != "persistent" and output_directory is None:
+            raise PermissionError(
+                "Benchmark export requires Persistent Mode or an explicitly selected output directory."
+            )
 
         output_root = Path(output_directory or (self.evaluator.dataset_path.parent / "experiments")).resolve()
         json_path = output_root / f"{experiment_id}.json"

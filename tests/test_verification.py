@@ -325,11 +325,15 @@ async def test_general_mode_accepts_textbook_claims_but_not_unsourced_numbers(mo
     ledger = EvidenceLedger(task_id="general_mode_test")
     await ledger.register_claim(claim)
 
-    feedback = await AdversarialReviewer(
+    reviewer = AdversarialReviewer(
         llm_client=GeminiClient(api_key="mock_key", client=mock_client)
-    ).review_claims(ledger=ledger, task_context="Benefits of unit testing")
+    )
+    feedback = await reviewer.review_claims(ledger=ledger, task_context="Benefits of unit testing")
 
     assert feedback[0].decision == expected
+    assert feedback[0].llm_decision == VerificationDecision.ACCEPT
+    assert feedback[0].deterministic_check_ids
+    assert reviewer.deterministic_checks
     if expected == VerificationDecision.ACCEPT:
         from agents.reviewer_agent import GENERAL_KNOWLEDGE_PREFIX
 
